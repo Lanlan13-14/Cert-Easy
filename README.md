@@ -8,3 +8,5 @@ sudo bash -c 'wget -O /usr/local/bin/cert-easy https://raw.githubusercontent.com
 ```
 sudo cert-easy
 ```
+### 3. 卸载
+###### 卸载选项在脚本中已提供
