@@ -108,7 +108,7 @@ ensure_cron_job() {
   # 温和：不替换/不删除已有 acme.sh --cron 条目；若检测到则提示
   if echo "$cr" | grep -Eq 'acme\.sh.*--cron'; then
     warn "检测到现有 acme.sh 续期任务：AUTO_RENEW 开关不控制其行为（仅作用于 cert-easy-cron）"
-  endtrue=1
+  fi
 }
 
 cron_status() {
