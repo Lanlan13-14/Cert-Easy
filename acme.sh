@@ -28,8 +28,13 @@ ensure_cmd openssl
 
 # ===== 配置文件处理 =====
 touch_if_absent() {
-  [[ -f "$1" ]] || { umask 077; : >"$1"; chmod 600 "$1"; }
+  if [[ ! -f "$1" ]]; then
+    umask 077
+    touch "$1"
+    chmod 600 "$1"
+  fi
 }
+
 load_config() {
   touch_if_absent "$CRED_FILE"
   set -a
@@ -501,18 +506,18 @@ main_menu() {
   while true; do
     echo
     echo "======== cert-easy ========"
-    echo "1) 申请/续期 证书 (DNS-01)"
-    echo "2) 列出已管理证书"
-    echo "3) 显示某域名证书路径"
-    echo "4) 删除证书（可选先吊销；自动移出续期清单）"
-    echo "5) 自动续期 开关 / 状态（不卸载 cron）: $(cron_status)"
-    echo "6) 凭据管理：新增/更新"
-    echo "7) 凭据管理：删除（删除前列出依赖域名）"
-    echo "8) 设置：重载命令 / 默认密钥长度 / 证书目录"
-    echo "9) 更新脚本（从远程重新拉取并重启）"
+    echo " 1) 申请/续期证书 (DNS-01)"
+    echo " 2) 列出已管理证书"
+    echo " 3) 显示某域名证书路径"
+    echo " 4) 删除证书（可选吊销并移出续期清单）"
+    echo " 5) 自动续期开关 / 状态：$(cron_status)"
+    echo " 6) 凭据管理：新增/更新"
+    echo " 7) 凭据管理：删除（删除前列出依赖域名）"
+    echo " 8) 设置：重载命令 / 默认密钥长度 / 证书目录"
+    echo " 9) 更新脚本（从远程拉取并重启）"
     echo "10) 卸载（一级/二级）"
-    echo "0) 退出"
-    ask "选择: "
+    echo " 0) 退出"
+    ask "请选择操作: "
     read -r op
     case "$op" in
       1) issue_flow ;;
@@ -522,21 +527,20 @@ main_menu() {
       5) toggle_auto_renew ;;
       6) add_or_update_creds ;;
       7) delete_provider_creds ;;
-      8)
-         echo "  a) 设置重载命令"
+      8) echo "  a) 设置重载命令"
          echo "  b) 设置默认密钥长度"
          echo "  c) 设置证书根目录"
-         ask "选择: "; read -r s
+         ask "选择: "
+         read -r s
          case "$s" in
            a) set_reload_cmd ;;
            b) set_keylen_default ;;
            c) set_outdir_base ;;
            *) warn "无效选择" ;;
-         esac
-         ;;
+         esac ;;
       9) update_self ;;
       10) uninstall_menu ;;
-      0) exit 0 ;;
+      0) echo -e "\033[1;32m[✔]\033[0m 已退出。下次使用请输入: sudo cert-easy"; exit 0 ;;
       *) warn "无效选择" ;;
     esac
   done
