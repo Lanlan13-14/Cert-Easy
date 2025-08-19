@@ -1,28 +1,32 @@
 #!/usr/bin/env bash
-# cert-easy: interactive DNS-01 ACME helper for Cloudflare/DNSPod/Aliyun/dynv6/Volcengine
-# requirements: bash, curl, openssl, crontab(optional)
+# cert-easy: 交互式 DNS-01 证书申请/管理，支持 Cloudflare / DNSPod(CN&Global) / 阿里云(CN&Global) / dynv6 / 火山引擎
+# 功能：申请/安装、列出/查看/删除证书；凭据新增/删除（删除前提示依赖域名）；温和的自动续期策略；更新脚本；两级卸载
+# 依赖：bash、curl、openssl、crontab(可选)
 set -Eeuo pipefail
 
-# ===== styling =====
-ok()   { echo -e "\033[1;32m[✔]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
-err()  { echo -e "\033[1;31m[✘]\033[0m $*"; }
-ask()  { echo -ne "\033[1;36m[?]\033[0m $*"; }
+# ===== 基础路径与默认值 =====
+SCRIPT_URL="${CERT_EASY_REMOTE_URL:-https://raw.githubusercontent.com/Lanlan13-14/Cert-Easy/refs/heads/main/acme.sh}"
 
-# ===== paths & defaults =====
 CRED_FILE="/root/.acme-cred"
 ACME_HOME="${HOME}/.acme.sh"
 ACME="${ACME_HOME}/acme.sh"
 OUT_DIR_BASE_DEFAULT="/etc/ssl/acme"
-KEYLEN_DEFAULT="ec-256"   # ec-256 | ec-384 | 2048 | 3072 | 4096
+KEYLEN_DEFAULT="ec-256"            # ec-256 | ec-384 | 2048 | 3072 | 4096
+AUTO_RENEW_DEFAULT="1"             # 1=开启自动续期；0=关闭但保留 cron 任务
 CRON_WRAPPER="/usr/local/bin/cert-easy-cron"
-AUTO_RENEW_DEFAULT="1"    # 1=开启自动续期；0=关闭，但保留 cron 任务
 
-ensure_cmd() { command -v "$1" >/dev/null 2>&1 || { err "缺少依赖: $1"; exit 1; }; }
+# ===== 样式 =====
+ok()   { echo -e "\033[1;32m[✔]\033[0m $*"; }
+warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
+err()  { echo -e "\033[1;31m[✘]\033[0m $*"; exit 1; }
+ask()  { echo -ne "\033[1;36m[?]\033[0m $*"; }
+self_path(){ readlink -f "$0" 2>/dev/null || echo "$0"; }
+
+ensure_cmd(){ command -v "$1" >/dev/null 2>&1 || err "缺少依赖: $1"; }
 ensure_cmd curl
 ensure_cmd openssl
 
-# ===== config load/save =====
+# ===== 配置文件处理 =====
 touch_if_absent() {
   [[ -f "$1" ]] || { umask 077; : >"$1"; chmod 600 "$1"; }
 }
@@ -41,7 +45,6 @@ save_kv() {
   local k="$1" v="$2"
   touch_if_absent "$CRED_FILE"
   if grep -qE "^${k}=" "$CRED_FILE"; then
-    # shellcheck disable=SC2001
     sed -i -E "s|^${k}=.*|${k}=${v//|/\\|}|" "$CRED_FILE"
   else
     echo "${k}=${v}" >>"$CRED_FILE"
@@ -60,35 +63,33 @@ init_minimal() {
   save_kv AUTO_RENEW "$AUTO_RENEW"
 }
 
-# ===== acme.sh install =====
+# ===== acme.sh 安装 =====
 ensure_acme() {
   if [[ ! -x "$ACME" ]]; then
     ok "安装 acme.sh ..."
     curl -fsSL https://get.acme.sh | sh -s email="${EMAIL}"
   fi
-  [[ -x "$ACME" ]] || { err "acme.sh 未安装成功"; exit 1; }
+  [[ -x "$ACME" ]] || err "acme.sh 未安装成功"
 }
 
-# ===== cron reconcile (温和策略) =====
+# ===== cron（温和策略）=====
 has_crontab() { command -v crontab >/dev/null 2>&1; }
 
 ensure_cron_wrapper() {
-  # 包装脚本：读取 AUTO_RENEW，若为 1 则执行 acme.sh --cron；否则安静退出
-  cat >"$CRON_WRAPPER" <<EOF
+  cat >"$CRON_WRAPPER" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-CRED_FILE="$CRED_FILE"
-ACME_HOME="$ACME_HOME"
-ACME="$ACME"
-AUTO_RENEW_DEFAULT="$AUTO_RENEW_DEFAULT"
-AUTO_RENEW="\$AUTO_RENEW_DEFAULT"
-if [[ -f "\$CRED_FILE" ]]; then
+CRED_FILE="/root/.acme-cred"
+ACME_HOME="$HOME/.acme.sh"
+ACME="${ACME_HOME}/acme.sh"
+AUTO_RENEW_DEFAULT="1"
+if [[ -f "$CRED_FILE" ]]; then
   # shellcheck disable=SC1090
-  . "\$CRED_FILE"
+  . "$CRED_FILE"
 fi
-AUTO_RENEW="\${AUTO_RENEW:-\$AUTO_RENEW_DEFAULT}"
-if [[ "\$AUTO_RENEW" = "1" ]]; then
-  "\$ACME" --cron --home "\$ACME_HOME" >/dev/null 2>&1 || true
+AUTO_RENEW="${AUTO_RENEW:-$AUTO_RENEW_DEFAULT}"
+if [[ "$AUTO_RENEW" = "1" ]]; then
+  "$ACME" --cron --home "$ACME_HOME" >/dev/null 2>&1 || true
 fi
 exit 0
 EOF
@@ -96,42 +97,35 @@ EOF
 }
 
 ensure_cron_job() {
-  has_crontab || { warn "系统未提供 crontab，跳过自动续期计划任务安装"; return 0; }
+  has_crontab || { warn "未检测到 crontab，跳过计划任务安装"; return 0; }
   ensure_cron_wrapper
-
-  # 读取现有 crontab（可能为空）
-  local cr cur new line
-  cr="$(crontab -l 2>/dev/null || true)"
-  line="7 3 * * * $CRON_WRAPPER # cert-easy"
-
-  if echo "$cr" | grep -qF "$CRON_WRAPPER"; then
-    # 已存在包装任务，保持不动
-    return 0
+  local cr; cr="$(crontab -l 2>/dev/null || true)"
+  local line="7 3 * * * $CRON_WRAPPER # cert-easy"
+  if ! echo "$cr" | grep -qF "$CRON_WRAPPER"; then
+    printf "%s\n%s\n" "$cr" "$line" | crontab -
+    ok "已安装 cert-easy 续期计划任务"
   fi
-
+  # 温和：不替换/不删除已有 acme.sh --cron 条目；若检测到则提示
   if echo "$cr" | grep -Eq 'acme\.sh.*--cron'; then
-    # 将原生 acme.sh cron 替换为包装任务（保留 cron，本地化控制 AUTO_RENEW）
-    new="$(echo "$cr" | sed -E "s|.*acme\.sh.*--cron.*|$line|g")"
-  else
-    # 追加包装任务
-    new="$cr"$'\n'"$line"
-  fi
-
-  printf "%s\n" "$new" | crontab -
-  ok "已确保安装 cert-easy 的自动续期计划任务（保留系统 cron）"
+    warn "检测到现有 acme.sh 续期任务：AUTO_RENEW 开关不控制其行为（仅作用于 cert-easy-cron）"
+  endtrue=1
 }
 
 cron_status() {
   load_config
-  echo "AUTO_RENEW=${AUTO_RENEW} / 计划任务$(has_crontab && echo 已配置 || echo 未配置)"
+  local has="未配置"
+  if has_crontab && crontab -l 2>/dev/null | grep -qF "$CRON_WRAPPER"; then
+    has="已配置"
+  fi
+  echo "AUTO_RENEW=${AUTO_RENEW} / 计划任务${has}"
 }
 
 toggle_auto_renew() {
   load_config
   if [[ "${AUTO_RENEW}" = "1" ]]; then
-    ask "检测到 AUTO_RENEW=1，是否关闭自动续期但保留 cron 任务? (y/N): "
+    ask "AUTO_RENEW=1，是否关闭自动续期但保留 cron 任务? (y/N): "
     read -r x
-    [[ "$x" =~ ^[Yy]$ ]] && save_kv AUTO_RENEW "0" && ok "已关闭自动续期（保留 cron 任务）"
+    [[ "$x" =~ ^[Yy]$ ]] && save_kv AUTO_RENEW "0" && ok "已关闭自动续期（保留 cron）"
   else
     ask "AUTO_RENEW=0，是否开启自动续期? (y/N): "
     read -r x
@@ -140,16 +134,16 @@ toggle_auto_renew() {
   ensure_cron_job
 }
 
-# ===== provider helpers =====
+# ===== 提供商相关 =====
 providers_menu() {
   cat <<EOF
 可用 DNS 提供商:
-  1) Cloudflare (cf)
-  2) DNSPod 中国站 (dnspod-cn)
-  3) DNSPod 国际站 (dnspod-global)
-  4) 阿里云 中国/国际 (aliyun-cn/aliyun-global)
-  5) dynv6 (dynv6)
-  6) 火山引擎 Volcengine (volcengine)
+  - Cloudflare (cf)
+  - DNSPod 中国站 (dnspod-cn)
+  - DNSPod 国际站 (dnspod-global)
+  - 阿里云 中国/国际 (aliyun-cn / aliyun-global)
+  - dynv6 (dynv6)
+  - 火山引擎 Volcengine (volcengine)
 EOF
 }
 
@@ -170,7 +164,7 @@ export_provider_env() {
     cf)
       if [[ -n "${CF_Token:-}" ]]; then export CF_Token; else
         if [[ -n "${CF_Key:-}" && -n "${CF_Email:-}" ]]; then export CF_Key CF_Email; else
-          err "Cloudflare 凭据缺失。请在 [凭据管理] 中添加 CF_Token 或 CF_Key+CF_Email"; return 1
+          err "Cloudflare 凭据缺失。请在 [凭据管理] 中添加 CF_Token 或 CF_Key+CF_Email"
         fi
       fi
       ;;
@@ -198,7 +192,7 @@ export_provider_env() {
       export VOLCENGINE_ACCESS_KEY VOLCENGINE_SECRET_KEY
       export VOLCENGINE_REGION="${VOLCENGINE_REGION:-cn-beijing}"
       ;;
-    *) err "未知 provider: $p"; return 1 ;;
+    *) err "未知 provider: $p" ;;
   esac
 }
 
@@ -209,7 +203,7 @@ add_or_update_creds() {
   read -r p
   case "$p" in
     cf)
-      ask "优先推荐 CF_Token。输入 CF_Token (留空则改为使用 CF_Key/CF_Email): "
+      ask "优先推荐 CF_Token。输入 CF_Token (留空则改为 CF_Key/CF_Email): "
       read -r t
       if [[ -n "$t" ]]; then
         save_kv CF_Token "$t"
@@ -246,7 +240,7 @@ add_or_update_creds() {
       ask "区域(默认 cn-beijing): "; read -r rg; rg=${rg:-cn-beijing}
       save_kv VOLCENGINE_ACCESS_KEY "$v1"; save_kv VOLCENGINE_SECRET_KEY "$v2"; save_kv VOLCENGINE_REGION "$rg"
       ;;
-    *) err "无效选择"; return 1;;
+    *) warn "无效选择"; return 1;;
   esac
   ok "凭据已写入 $CRED_FILE"
 }
@@ -262,7 +256,7 @@ provider_env_keys() {
 }
 
 scan_provider_usage() {
-  # outputs: "provider<TAB>domain"
+  # 输出: "provider<TAB>domain"
   local conf
   find "$ACME_HOME" -type f -name "*.conf" 2>/dev/null | while read -r conf; do
     [[ "$(basename "$conf")" == "account.conf" ]] && continue
@@ -289,7 +283,6 @@ delete_provider_creds() {
     dnspod-cn|dnspod-global) short="dnspod" ;;
     aliyun-cn|aliyun-global) short="aliyun" ;;
   esac
-
   local inuse=()
   while IFS=$'\t' read -r prov dom; do
     [[ "$prov" == "$short" ]] && inuse+=("$dom")
@@ -304,10 +297,10 @@ delete_provider_creds() {
 
   ask "仍要删除 $label 的凭据吗? (yes/NO): "
   read -r ans
-  [[ "$ans" == "yes" ]] || { warn "已取消删除。"; return 0; }
+  [[ "$ans" == "yes" ]] || { warn "已取消删除"; return 0; }
 
   if ((${#inuse[@]})); then
-    ask "是否同时删除上述证书（并移出续期列表）? (y/N): "
+    ask "是否同时删除上述证书（并移出续期清单）? (y/N): "
     read -r rmcert
     if [[ "$rmcert" =~ ^[Yy]$ ]]; then
       ensure_acme
@@ -327,12 +320,13 @@ delete_provider_creds() {
   ok "已从 $CRED_FILE 删除 $label 的凭据"
 }
 
-# ===== issue / install =====
+# ===== 证书申请/安装 =====
 prompt_issue_params() {
   ask "🌐 选择提供商 (cf/dnspod-cn/dnspod-global/aliyun-cn/aliyun-global/dynv6/volcengine): "
   read -r PROVIDER
   ask "📛 主域名 (如 example.com): "
   read -r DOMAIN
+  echo "提示：通配符 *.${DOMAIN} 可覆盖 www/api 等所有一级子域，需 DNS-01 验证。"
   ask "✨ 是否添加通配符 *.${DOMAIN}? (y/N): "
   read -r WILD
   ask "➕ 额外域名(逗号分隔，可空): "
@@ -348,8 +342,8 @@ issue_flow() {
   prompt_issue_params
 
   ensure_acme
-  export_provider_env "$PROVIDER" || return 1
-  local DNS_API; DNS_API=$(provider_to_dnsapi "$PROVIDER") || { err "provider 无效"; return 1; }
+  export_provider_env "$PROVIDER"
+  local DNS_API; DNS_API=$(provider_to_dnsapi "$PROVIDER") || err "provider 无效"
 
   local dom_args=(-d "$DOMAIN")
   [[ "$WILD" =~ ^[Yy]$ ]] && dom_args+=(-d "*.${DOMAIN}")
@@ -386,17 +380,15 @@ issue_flow() {
   chmod 600 "$OUT_DIR/privkey.key"
   chmod 644 "$OUT_DIR/"*.pem
 
-  ok "签发完成。证书存储路径：$OUT_DIR"
+  ok "签发完成。证书与密钥路径："
   echo "  - 私钥:        $OUT_DIR/privkey.key"
   echo "  - 证书:        $OUT_DIR/cert.pem"
   echo "  - 链证书:      $OUT_DIR/chain.pem"
   echo "  - 全链:        $OUT_DIR/fullchain.pem"
-
-  # 确保计划任务存在（温和策略）
   ensure_cron_job
 }
 
-# ===== list / show / delete certs =====
+# ===== 证书管理 =====
 list_certs() {
   ensure_acme
   "$ACME" --list
@@ -424,10 +416,8 @@ delete_cert() {
   if [[ "$rv" =~ ^[Yy]$ ]]; then
     "$ACME" --revoke -d "$d" || warn "吊销失败或已吊销: $d"
   fi
-  # --remove 会从 acme.sh 的续期清单删除该域名，相当于移除了对应的自动续期任务
   "$ACME" --remove -d "$d" && ok "已删除证书管理项并移出续期清单：$d"
 
-  # 可选删除本地文件
   load_config
   local p="${OUT_DIR_BASE}/${d}"
   if [[ -d "$p" ]]; then
@@ -435,14 +425,12 @@ delete_cert() {
     read -r delp
     [[ "$delp" =~ ^[Yy]$ ]] && rm -rf -- "$p" && ok "已删除 $p"
   fi
-
-  # 保留 cron：不做任何 cron 卸载操作
 }
 
-# ===== auto-renew settings =====
+# ===== 设置 =====
 set_reload_cmd() {
   load_config
-  ask "输入证书安装/续期后执行的重载命令（留空取消，例如 systemctl reload nginx）: "
+  ask "输入安装/续期后执行的重载命令（如 systemctl reload nginx，留空清除）: "
   read -r rc
   save_kv RELOAD_CMD "$rc"
   if [[ -n "$rc" ]]; then ok "已设置重载命令：$rc"; else ok "已清空重载命令"; fi
@@ -461,10 +449,54 @@ set_outdir_base() {
   [[ -n "$o" ]] && save_kv OUT_DIR_BASE "$o" && ok "证书根目录设为 $o"
 }
 
-# ===== creds usage & deletion =====
-delete_provider_creds_entrypoint() { delete_provider_creds; }
+# ===== 更新与卸载 =====
+update_self() {
+  ask "确认从远程更新脚本并立即重启？(y/N): "
+  read -r ans
+  [[ "$ans" =~ ^[Yy]$ ]] || { warn "已取消更新"; return; }
+  local tmp
+  tmp="$(mktemp)"
+  curl -fsSL "$SCRIPT_URL" -o "$tmp" || { rm -f "$tmp"; err "下载失败"; }
+  head -n1 "$tmp" | grep -qE '^#!/usr/bin/env bash' || { rm -f "$tmp"; err "非法脚本头"; }
+  chmod --reference="$(self_path)" "$tmp" 2>/dev/null || chmod 755 "$tmp"
+  mv "$tmp" "$(self_path)"
+  ok "脚本已更新"
+  exec "$(self_path)"
+}
 
-# ===== menu =====
+purge_cron() {
+  command -v crontab >/dev/null 2>&1 || return
+  local cr; cr="$(crontab -l 2>/dev/null || true)"
+  [[ -z "$cr" ]] && return
+  cr="$(printf "%s\n" "$cr" | sed -E '/cert-easy-cron/d;/acme\.sh.*--cron/d')"
+  printf "%s\n" "$cr" | crontab -
+}
+
+uninstall_menu() {
+  echo "a) 仅删除本脚本（保留 acme.sh、证书、凭据、cron）"
+  echo "b) 完全卸载（删除 acme.sh、证书、凭据、cron 与本脚本）"
+  ask "选择: "
+  read -r s
+  case "$s" in
+    a|A)
+      rm -f -- "$(self_path)"
+      ok "已删除本脚本"
+      ;;
+    b|B)
+      ask "危险操作，确认完全卸载? (yes/NO): "
+      read -r y
+      [[ "$y" == "yes" ]] || { warn "已取消"; return; }
+      purge_cron
+      rm -f -- "$CRON_WRAPPER"
+      rm -rf -- "$OUT_DIR_BASE_DEFAULT" "$CRED_FILE" "$ACME_HOME"
+      rm -f -- "$(self_path)"
+      ok "已完成完全卸载"
+      ;;
+    *) warn "无效选择" ;;
+  esac
+}
+
+# ===== 主菜单 =====
 main_menu() {
   while true; do
     echo
@@ -475,9 +507,11 @@ main_menu() {
     echo "4) 删除证书（可选先吊销；自动移出续期清单）"
     echo "5) 自动续期 开关 / 状态（不卸载 cron）: $(cron_status)"
     echo "6) 凭据管理：新增/更新"
-    echo "7) 凭据管理：删除（安全提示域名关联）"
+    echo "7) 凭据管理：删除（删除前列出依赖域名）"
     echo "8) 设置：重载命令 / 默认密钥长度 / 证书目录"
-    echo "9) 退出"
+    echo "9) 更新脚本（从远程重新拉取并重启）"
+    echo "10) 卸载（一级/二级）"
+    echo "0) 退出"
     ask "选择: "
     read -r op
     case "$op" in
@@ -487,7 +521,7 @@ main_menu() {
       4) delete_cert ;;
       5) toggle_auto_renew ;;
       6) add_or_update_creds ;;
-      7) delete_provider_creds_entrypoint ;;
+      7) delete_provider_creds ;;
       8)
          echo "  a) 设置重载命令"
          echo "  b) 设置默认密钥长度"
@@ -500,13 +534,15 @@ main_menu() {
            *) warn "无效选择" ;;
          esac
          ;;
-      9) exit 0 ;;
+      9) update_self ;;
+      10) uninstall_menu ;;
+      0) exit 0 ;;
       *) warn "无效选择" ;;
     esac
   done
 }
 
-# ===== run =====
+# ===== 启动 =====
 init_minimal
 ensure_acme
 ensure_cron_job
