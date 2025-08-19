@@ -14,4 +14,4 @@ sudo cert-easy
 ### 注意
 - 请先前往凭据管理添加相关信息后再申请证书
 - 如果需要以http验证申请证书，友情推荐
-https://github.com/qichiyuhub/autoshell
+https://github.com/qichiyuhub/auto-ssl-cert
