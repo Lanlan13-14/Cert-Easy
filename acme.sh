@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cert-easy: 交互式 DNS-01 证书申请/管理，支持 Cloudflare / DNSPod(CN&Global) / 阿里云(CN&Global) / dynv6 / 火山引擎
+# cert-easy: 交互式 DNS-01 证书申请/管理，支持 Cloudflare / DNSPod(CN&Global) / 阿里云(CN&Global) / dynv6 / 火山引擎 / 华为云(CN&Global) / 百度云
 # 功能：申请/安装、列出/查看/删除证书；凭据新增/删除（删除前提示依赖域名）；温和的自动续期策略；更新脚本；两级卸载
 # 依赖：bash、curl、openssl、crontab(可选)
 set -Eeuo pipefail
@@ -149,6 +149,9 @@ providers_menu() {
   - 阿里云 中国/国际 (aliyun-cn / aliyun-global)
   - dynv6 (dynv6)
   - 火山引擎 Volcengine (volcengine)
+  - 华为云 中国站 (huaweicloud-cn)
+  - 华为云 国际站 (huaweicloud-global)
+  - 百度云 (baidu)
 EOF
 }
 
@@ -159,6 +162,9 @@ provider_to_dnsapi() {
     aliyun-cn|aliyun-global)  echo "dns_ali" ;;
     dynv6)                    echo "dns_dynv6" ;;
     volcengine)               echo "dns_volcengine" ;;
+    huaweicloud-cn)           echo "dns_huaweicloud" ;;
+    huaweicloud-global)       echo "dns_huaweicloud" ;;
+    baidu)                    echo "dns_baidu" ;;
     *) return 1 ;;
   esac
 }
@@ -197,6 +203,25 @@ export_provider_env() {
       export VOLCENGINE_ACCESS_KEY VOLCENGINE_SECRET_KEY
       export VOLCENGINE_REGION="${VOLCENGINE_REGION:-cn-beijing}"
       ;;
+    huaweicloud-cn)
+      : "${HUAWEICLOUD_Username:?缺少 HUAWEICLOUD_Username}"
+      : "${HUAWEICLOUD_Password:?缺少 HUAWEICLOUD_Password}"
+      : "${HUAWEICLOUD_ProjectID:?缺少 HUAWEICLOUD_ProjectID}"
+      export HUAWEICLOUD_Username HUAWEICLOUD_Password HUAWEICLOUD_ProjectID
+      export HUAWEICLOUD_IdentityEndpoint="${HUAWEICLOUD_IdentityEndpoint:-https://iam.myhuaweicloud.com}"
+      ;;
+    huaweicloud-global)
+      : "${HUAWEICLOUD_Username:?缺少 HUAWEICLOUD_Username}"
+      : "${HUAWEICLOUD_Password:?缺少 HUAWEICLOUD_Password}"
+      : "${HUAWEICLOUD_ProjectID:?缺少 HUAWEICLOUD_ProjectID}"
+      export HUAWEICLOUD_Username HUAWEICLOUD_Password HUAWEICLOUD_ProjectID
+      export HUAWEICLOUD_IdentityEndpoint="${HUAWEICLOUD_IdentityEndpoint:-https://iam.myhuaweicloud.com}"
+      ;;
+    baidu)
+      : "${BAIDU_AK:?缺少 BAIDU_AK}"
+      : "${BAIDU_SK:?缺少 BAIDU_SK}"
+      export BAIDU_AK BAIDU_SK
+      ;;
     *) err "未知 provider: $p" ;;
   esac
 }
@@ -204,7 +229,7 @@ export_provider_env() {
 add_or_update_creds() {
   load_config
   providers_menu
-  ask "选择提供商代号 (cf/dnspod-cn/dnspod-global/aliyun-cn/aliyun-global/dynv6/volcengine): "
+  ask "选择提供商代号 (cf/dnspod-cn/dnspod-global/aliyun-cn/aliyun-global/dynv6/volcengine/huaweicloud-cn/huaweicloud-global/baidu): "
   read -r p
   case "$p" in
     cf)
@@ -245,6 +270,33 @@ add_or_update_creds() {
       ask "区域(默认 cn-beijing): "; read -r rg; rg=${rg:-cn-beijing}
       save_kv VOLCENGINE_ACCESS_KEY "$v1"; save_kv VOLCENGINE_SECRET_KEY "$v2"; save_kv VOLCENGINE_REGION "$rg"
       ;;
+    huaweicloud-cn)
+      ask "输入 HUAWEICLOUD_Username: "; read -r username
+      ask "输入 HUAWEICLOUD_Password: "; read -r password
+      ask "输入 HUAWEICLOUD_ProjectID: "; read -r projectid
+      ask "输入 HUAWEICLOUD_IdentityEndpoint (默认 https://iam.myhuaweicloud.com): "; read -r endpoint
+      endpoint="${endpoint:-https://iam.myhuaweicloud.com}"
+      save_kv HUAWEICLOUD_Username "$username"
+      save_kv HUAWEICLOUD_Password "$password"
+      save_kv HUAWEICLOUD_ProjectID "$projectid"
+      save_kv HUAWEICLOUD_IdentityEndpoint "$endpoint"
+      ;;
+    huaweicloud-global)
+      ask "输入 HUAWEICLOUD_Username: "; read -r username
+      ask "输入 HUAWEICLOUD_Password: "; read -r password
+      ask "输入 HUAWEICLOUD_ProjectID: "; read -r projectid
+      ask "输入 HUAWEICLOUD_IdentityEndpoint (默认 https://iam.myhuaweicloud.com): "; read -r endpoint
+      endpoint="${endpoint:-https://iam.myhuaweicloud.com}"
+      save_kv HUAWEICLOUD_Username "$username"
+      save_kv HUAWEICLOUD_Password "$password"
+      save_kv HUAWEICLOUD_ProjectID "$projectid"
+      save_kv HUAWEICLOUD_IdentityEndpoint "$endpoint"
+      ;;
+    baidu)
+      ask "输入 BAIDU_AK: "; read -r ak
+      ask "输入 BAIDU_SK: "; read -r sk
+      save_kv BAIDU_AK "$ak"; save_kv BAIDU_SK "$sk"
+      ;;
     *) warn "无效选择"; return 1;;
   esac
   ok "凭据已写入 $CRED_FILE"
@@ -257,6 +309,8 @@ provider_env_keys() {
     aliyun-cn|aliyun-global) echo "Ali_Key Ali_Secret" ;;
     dynv6) echo "DYNV6_TOKEN" ;;
     volcengine) echo "VOLCENGINE_ACCESS_KEY VOLCENGINE_SECRET_KEY VOLCENGINE_REGION" ;;
+    huaweicloud-cn|huaweicloud-global) echo "HUAWEICLOUD_Username HUAWEICLOUD_Password HUAWEICLOUD_ProjectID HUAWEICLOUD_IdentityEndpoint" ;;
+    baidu) echo "BAIDU_AK BAIDU_SK" ;;
   esac
 }
 
@@ -274,6 +328,8 @@ scan_provider_usage() {
       dns_ali)         echo -e "aliyun\t${domain}" ;;
       dns_dynv6)       echo -e "dynv6\t${domain}" ;;
       dns_volcengine)  echo -e "volcengine\t${domain}" ;;
+      dns_huaweicloud) echo -e "huaweicloud\t${domain}" ;;
+      dns_baidu)       echo -e "baidu\t${domain}" ;;
     esac
   done
 }
@@ -281,12 +337,13 @@ scan_provider_usage() {
 delete_provider_creds() {
   load_config
   providers_menu
-  ask "选择要删除凭据的提供商 (cf/dnspod-cn/dnspod-global/aliyun-cn/aliyun-global/dynv6/volcengine): "
+  ask "选择要删除凭据的提供商 (cf/dnspod-cn/dnspod-global/aliyun-cn/aliyun-global/dynv6/volcengine/huaweicloud-cn/huaweicloud-global/baidu): "
   read -r p
   local label="$p" short="$p"
   case "$p" in
     dnspod-cn|dnspod-global) short="dnspod" ;;
     aliyun-cn|aliyun-global) short="aliyun" ;;
+    huaweicloud-cn|huaweicloud-global) short="huaweicloud" ;;
   esac
   local inuse=()
   while IFS=$'\t' read -r prov dom; do
@@ -322,12 +379,12 @@ delete_provider_creds() {
   for k in $keys; do
     sed -i -E "/^${k}=.*/d" "$CRED_FILE"
   done
-  ok "已从 $CRED_FILE 删除 $label 的凭据"
+  ok "已从 $CRED_FILE 删除 $label 的凭迹"
 }
 
 # ===== 证书申请/安装 =====
 prompt_issue_params() {
-  ask "🌐 选择提供商 (cf/dnspod-cn/dnspod-global/aliyun-cn/aliyun-global/dynv6/volcengine): "
+  ask "🌐 选择提供商 (cf/dnspod-cn/dnspod-global/aliyun-cn/aliyun-global/dynv6/volcengine/huaweicloud-cn/huaweicloud-global/baidu): "
   read -r PROVIDER
   ask "📛 主域名 (如 example.com): "
   read -r DOMAIN
@@ -459,14 +516,47 @@ update_self() {
   ask "确认从远程更新脚本并立即重启？(y/N): "
   read -r ans
   [[ "$ans" =~ ^[Yy]$ ]] || { warn "已取消更新"; return; }
+  
+  # 创建备份
+  local self_path
+  self_path="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  local backup_path="${self_path}.bak"
+  cp "$self_path" "$backup_path"
+  ok "已创建备份: $backup_path"
+  
   local tmp
   tmp="$(mktemp)"
-  curl -fsSL "$SCRIPT_URL" -o "$tmp" || { rm -f "$tmp"; err "下载失败"; }
-  head -n1 "$tmp" | grep -qE '^#!/usr/bin/env bash' || { rm -f "$tmp"; err "非法脚本头"; }
-  chmod --reference="$(self_path)" "$tmp" 2>/dev/null || chmod 755 "$tmp"
-  mv "$tmp" "$(self_path)"
-  ok "脚本已更新"
-  exec "$(self_path)"
+  if curl -fsSL "$SCRIPT_URL" -o "$tmp"; then
+    # 检查下载的脚本是否有效
+    if bash -n "$tmp" 2>/dev/null; then
+      chmod --reference="$self_path" "$tmp" 2>/dev/null || chmod 755 "$tmp"
+      mv "$tmp" "$self_path"
+      ok "脚本已更新"
+      
+      # 询问是否重新加载脚本
+      ask "是否立即重新加载脚本？(y/N): "
+      read -r reload_choice
+      if [[ "$reload_choice" == "y" ]]; then
+        echo "🔄 重新加载脚本..."
+        exec "$self_path"
+      else
+        echo "ℹ️  下次使用请输入: sudo cert-easy"
+      fi
+      
+      # 删除备份
+      rm -f "$backup_path"
+    else
+      echo "❌ 下载的脚本语法有误，恢复备份..."
+      mv "$backup_path" "$self_path"
+      rm -f "$tmp"
+      err "已恢复备份脚本"
+    fi
+  else
+    echo "❌ 更新失败，恢复备份..."
+    mv "$backup_path" "$self_path"
+    rm -f "$tmp"
+    err "已恢复备份脚本，请检查网络或链接是否有效"
+  fi
 }
 
 purge_cron() {
