@@ -516,14 +516,14 @@ update_self() {
   ask "确认从远程更新脚本并立即重启？(y/N): "
   read -r ans
   [[ "$ans" =~ ^[Yy]$ ]] || { warn "已取消更新"; return; }
-  
+
   # 创建备份
   local self_path
   self_path="$(readlink -f "$0" 2>/dev/null || echo "$0")"
   local backup_path="${self_path}.bak"
   cp "$self_path" "$backup_path"
   ok "已创建备份: $backup_path"
-  
+
   local tmp
   tmp="$(mktemp)"
   if curl -fsSL "$SCRIPT_URL" -o "$tmp"; then
@@ -532,19 +532,19 @@ update_self() {
       chmod --reference="$self_path" "$tmp" 2>/dev/null || chmod 755 "$tmp"
       mv "$tmp" "$self_path"
       ok "脚本已更新"
-      
+
       # 询问是否重新加载脚本
       ask "是否立即重新加载脚本？(y/N): "
       read -r reload_choice
-      if [[ "$reload_choice" == "y" ]]; then
+      if [[ "$reload_choice" =~ ^[Yy]$ ]]; then
         echo "🔄 重新加载脚本..."
+        rm -f "$backup_path"   # ✅ 立即删除备份
         exec "$self_path"
       else
         echo "ℹ️  下次使用请输入: sudo cert-easy"
+        rm -f "$backup_path"   # ✅ 不重启也会删除备份
+        ok "已删除备份: $backup_path"
       fi
-      
-      # 删除备份
-      rm -f "$backup_path"
     else
       echo "❌ 下载的脚本语法有误，恢复备份..."
       mv "$backup_path" "$self_path"
