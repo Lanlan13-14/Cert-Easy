@@ -26,6 +26,55 @@ ensure_cmd(){ command -v "$1" >/dev/null 2>&1 || err "缺少依赖: $1"; }
 ensure_cmd curl
 ensure_cmd openssl
 
+# ===== 通用选择函数 =====
+select_provider() {
+  echo "可用 DNS 提供商:"
+  echo " [1] Cloudflare (cf)"
+  echo " [2] DNSPod 中国站 (dnspod-cn)"
+  echo " [3] DNSPod 国际站 (dnspod-global)"
+  echo " [4] 阿里云 中国 (aliyun-cn)"
+  echo " [5] 阿里云 国际 (aliyun-global)"
+  echo " [6] dynv6 (dynv6)"
+  echo " [7] 火山引擎 Volcengine (volcengine)"
+  echo " [8] 华为云 中国站 (huaweicloud-cn)"
+  echo " [9] 华为云 国际站 (huaweicloud-global)"
+  echo " [10] 百度云 (baidu)"
+  ask "选择提供商: "
+  read -r choice
+  case "$choice" in
+    1) echo "cf" ;;
+    2) echo "dnspod-cn" ;;
+    3) echo "dnspod-global" ;;
+    4) echo "aliyun-cn" ;;
+    5) echo "aliyun-global" ;;
+    6) echo "dynv6" ;;
+    7) echo "volcengine" ;;
+    8) echo "huaweicloud-cn" ;;
+    9) echo "huaweicloud-global" ;;
+    10) echo "baidu" ;;
+    *) warn "无效选择"; return 1 ;;
+  esac
+}
+
+yes_no() {
+  echo " [1] 是 (y)"
+  echo " [2] 否 (n)"
+  ask "$1: "
+  read -r choice
+  case "$choice" in
+    1) echo "y" ;;
+    *) echo "n" ;;
+  esac
+}
+
+confirm() {
+  echo " [1] 是"
+  echo " [2] 否"
+  ask "$1: "
+  read -r choice
+  [[ "$choice" == "1" ]]
+}
+
 # ===== 配置文件处理 =====
 touch_if_absent() {
   if [[ ! -f "$1" ]]; then
@@ -127,34 +176,20 @@ cron_status() {
 
 toggle_auto_renew() {
   load_config
+  local action
   if [[ "${AUTO_RENEW}" = "1" ]]; then
-    ask "AUTO_RENEW=1，是否关闭自动续期但保留 cron 任务? (y/N): "
-    read -r x
-    [[ "$x" =~ ^[Yy]$ ]] && save_kv AUTO_RENEW "0" && ok "已关闭自动续期（保留 cron）"
+    action="关闭自动续期但保留 cron 任务"
   else
-    ask "AUTO_RENEW=0，是否开启自动续期? (y/N): "
-    read -r x
-    [[ "$x" =~ ^[Yy]$ ]] && save_kv AUTO_RENEW "1" && ok "已开启自动续期"
+    action="开启自动续期"
+  fi
+  if confirm "AUTO_RENEW=${AUTO_RENEW}，是否 ${action}"; then
+    save_kv AUTO_RENEW "$((${AUTO_RENEW:-0} ^ 1))"
+    ok "已${action==*"开启"* && "开启" || "关闭"}自动续期"
   fi
   ensure_cron_job
 }
 
 # ===== 提供商相关 =====
-providers_menu() {
-  cat <<EOF
-可用 DNS 提供商:
-  - Cloudflare (cf)
-  - DNSPod 中国站 (dnspod-cn)
-  - DNSPod 国际站 (dnspod-global)
-  - 阿里云 中国/国际 (aliyun-cn / aliyun-global)
-  - dynv6 (dynv6)
-  - 火山引擎 Volcengine (volcengine)
-  - 华为云 中国站 (huaweicloud-cn)
-  - 华为云 国际站 (huaweicloud-global)
-  - 百度云 (baidu)
-EOF
-}
-
 provider_to_dnsapi() {
   case "$1" in
     cf)                       echo "dns_cf" ;;
@@ -228,19 +263,20 @@ export_provider_env() {
 
 add_or_update_creds() {
   load_config
-  providers_menu
-  ask "选择提供商代号 (cf/dnspod-cn/dnspod-global/aliyun-cn/aliyun-global/dynv6/volcengine/huaweicloud-cn/huaweicloud-global/baidu): "
-  read -r p
+  local p
+  p=$(select_provider) || return 1
   case "$p" in
     cf)
-      ask "优先推荐 CF_Token。输入 CF_Token (留空则改为 CF_Key/CF_Email): "
-      read -r t
-      if [[ -n "$t" ]]; then
+      if confirm "优先推荐 CF_Token。是否输入 CF_Token (否则改为 CF_Key/CF_Email)"; then
+        ask "输入 CF_Token: "
+        read -r t
+        [[ -n "$t" ]] || { warn "输入为空"; return 1; }
         save_kv CF_Token "$t"
         sed -i -E '/^(CF_Key|CF_Email)=/d' "$CRED_FILE"
       else
         ask "输入 CF_Key (Global API Key): "; read -r k
         ask "输入 CF_Email: "; read -r m
+        [[ -n "$k" && -n "$m" ]] || { warn "输入不完整"; return 1; }
         save_kv CF_Key "$k"; save_kv CF_Email "$m"
         sed -i -E '/^CF_Token=/d' "$CRED_FILE"
       fi
@@ -248,45 +284,40 @@ add_or_update_creds() {
     dnspod-cn)
       ask "输入 DP_Id: "; read -r id
       ask "输入 DP_Key: "; read -r key
+      [[ -n "$id" && -n "$key" ]] || { warn "输入不完整"; return 1; }
       save_kv DP_Id "$id"; save_kv DP_Key "$key"; save_kv DP_ENDPOINT "https://dnsapi.cn"
       ;;
     dnspod-global)
       ask "输入 DP_Id: "; read -r id
       ask "输入 DP_Key: "; read -r key
+      [[ -n "$id" && -n "$key" ]] || { warn "输入不完整"; return 1; }
       save_kv DP_Id "$id"; save_kv DP_Key "$key"; save_kv DP_ENDPOINT "https://api.dnspod.com"
       ;;
     aliyun-cn|aliyun-global)
       ask "输入 Ali_Key: "; read -r ak
       ask "输入 Ali_Secret: "; read -r sk
+      [[ -n "$ak" && -n "$sk" ]] || { warn "输入不完整"; return 1; }
       save_kv Ali_Key "$ak"; save_kv Ali_Secret "$sk"
       ;;
     dynv6)
       ask "输入 DYNV6_TOKEN: "; read -r dv
+      [[ -n "$dv" ]] || { warn "输入为空"; return 1; }
       save_kv DYNV6_TOKEN "$dv"
       ;;
     volcengine)
       ask "输入 VOLCENGINE_ACCESS_KEY: "; read -r v1
       ask "输入 VOLCENGINE_SECRET_KEY: "; read -r v2
       ask "区域(默认 cn-beijing): "; read -r rg; rg=${rg:-cn-beijing}
+      [[ -n "$v1" && -n "$v2" ]] || { warn "输入不完整"; return 1; }
       save_kv VOLCENGINE_ACCESS_KEY "$v1"; save_kv VOLCENGINE_SECRET_KEY "$v2"; save_kv VOLCENGINE_REGION "$rg"
       ;;
-    huaweicloud-cn)
+    huaweicloud-cn|huaweicloud-global)
       ask "输入 HUAWEICLOUD_Username: "; read -r username
       ask "输入 HUAWEICLOUD_Password: "; read -r password
       ask "输入 HUAWEICLOUD_ProjectID: "; read -r projectid
       ask "输入 HUAWEICLOUD_IdentityEndpoint (默认 https://iam.myhuaweicloud.com): "; read -r endpoint
       endpoint="${endpoint:-https://iam.myhuaweicloud.com}"
-      save_kv HUAWEICLOUD_Username "$username"
-      save_kv HUAWEICLOUD_Password "$password"
-      save_kv HUAWEICLOUD_ProjectID "$projectid"
-      save_kv HUAWEICLOUD_IdentityEndpoint "$endpoint"
-      ;;
-    huaweicloud-global)
-      ask "输入 HUAWEICLOUD_Username: "; read -r username
-      ask "输入 HUAWEICLOUD_Password: "; read -r password
-      ask "输入 HUAWEICLOUD_ProjectID: "; read -r projectid
-      ask "输入 HUAWEICLOUD_IdentityEndpoint (默认 https://iam.myhuaweicloud.com): "; read -r endpoint
-      endpoint="${endpoint:-https://iam.myhuaweicloud.com}"
+      [[ -n "$username" && -n "$password" && -n "$projectid" ]] || { warn "输入不完整"; return 1; }
       save_kv HUAWEICLOUD_Username "$username"
       save_kv HUAWEICLOUD_Password "$password"
       save_kv HUAWEICLOUD_ProjectID "$projectid"
@@ -295,9 +326,9 @@ add_or_update_creds() {
     baidu)
       ask "输入 BAIDU_AK: "; read -r ak
       ask "输入 BAIDU_SK: "; read -r sk
+      [[ -n "$ak" && -n "$sk" ]] || { warn "输入不完整"; return 1; }
       save_kv BAIDU_AK "$ak"; save_kv BAIDU_SK "$sk"
       ;;
-    *) warn "无效选择"; return 1;;
   esac
   ok "凭据已写入 $CRED_FILE"
 }
@@ -336,9 +367,8 @@ scan_provider_usage() {
 
 delete_provider_creds() {
   load_config
-  providers_menu
-  ask "选择要删除凭据的提供商 (cf/dnspod-cn/dnspod-global/aliyun-cn/aliyun-global/dynv6/volcengine/huaweicloud-cn/huaweicloud-global/baidu): "
-  read -r p
+  local p
+  p=$(select_provider) || return 1
   local label="$p" short="$p"
   case "$p" in
     dnspod-cn|dnspod-global) short="dnspod" ;;
@@ -357,14 +387,13 @@ delete_provider_creds() {
     ok "未发现使用 $label 的已签发证书"
   fi
 
-  ask "仍要删除 $label 的凭据吗? (yes/NO): "
-  read -r ans
-  [[ "$ans" == "yes" ]] || { warn "已取消删除"; return 0; }
+  if ! confirm "仍要删除 $label 的凭据吗"; then
+    warn "已取消删除"
+    return 0
+  fi
 
   if ((${#inuse[@]})); then
-    ask "是否同时删除上述证书（并移出续期清单）? (y/N): "
-    read -r rmcert
-    if [[ "$rmcert" =~ ^[Yy]$ ]]; then
+    if confirm "是否同时删除上述证书（并移出续期清单）"; then
       ensure_acme
       for d in "${inuse[@]}"; do
         ok "删除证书: $d"
@@ -379,24 +408,23 @@ delete_provider_creds() {
   for k in $keys; do
     sed -i -E "/^${k}=.*/d" "$CRED_FILE"
   done
-  ok "已从 $CRED_FILE 删除 $label 的凭迹"
+  ok "已从 $CRED_FILE 删除 $label 的凭据"
 }
 
 # ===== 证书申请/安装 =====
 prompt_issue_params() {
-  ask "🌐 选择提供商 (cf/dnspod-cn/dnspod-global/aliyun-cn/aliyun-global/dynv6/volcengine/huaweicloud-cn/huaweicloud-global/baidu): "
-  read -r PROVIDER
+  local p
+  p=$(select_provider) || return 1
+  PROVIDER="$p"
   ask "📛 主域名 (如 example.com): "
   read -r DOMAIN
   echo "提示：通配符 *.${DOMAIN} 可覆盖 www/api 等所有一级子域，需 DNS-01 验证。"
-  ask "✨ 是否添加通配符 *.${DOMAIN}? (y/N): "
-  read -r WILD
+  WILD=$(yes_no "是否添加通配符 *.${DOMAIN}")
   ask "➕ 额外域名(逗号分隔，可空): "
   read -r ALT
   ask "🔑 密钥长度 [默认 ${KEYLEN_DEFAULT}]: "
   read -r KEYLEN; KEYLEN=${KEYLEN:-$KEYLEN_DEFAULT}
-  ask "🧪 使用测试环境(避免频率限制)? (y/N): "
-  read -r STG
+  STG=$(yes_no "🧪 使用测试环境(避免频率限制)")
 }
 
 issue_flow() {
@@ -473,9 +501,7 @@ delete_cert() {
   ensure_acme
   ask "输入要删除的域名: "
   read -r d
-  ask "是否先吊销该证书（可选）? (y/N): "
-  read -r rv
-  if [[ "$rv" =~ ^[Yy]$ ]]; then
+  if confirm "是否先吊销该证书（可选）"; then
     "$ACME" --revoke -d "$d" || warn "吊销失败或已吊销: $d"
   fi
   "$ACME" --remove -d "$d" && ok "已删除证书管理项并移出续期清单：$d"
@@ -483,9 +509,9 @@ delete_cert() {
   load_config
   local p="${OUT_DIR_BASE}/${d}"
   if [[ -d "$p" ]]; then
-    ask "删除本地证书文件目录 $p ? (y/N): "
-    read -r delp
-    [[ "$delp" =~ ^[Yy]$ ]] && rm -rf -- "$p" && ok "已删除 $p"
+    if confirm "删除本地证书文件目录 $p"; then
+      rm -rf -- "$p" && ok "已删除 $p"
+    fi
   fi
 }
 
@@ -513,9 +539,10 @@ set_outdir_base() {
 
 # ===== 更新与卸载 =====
 update_self() {
-  ask "确认从远程更新脚本并立即重启？(y/N): "
-  read -r ans
-  [[ "$ans" =~ ^[Yy]$ ]] || { warn "已取消更新"; return; }
+  if ! confirm "确认从远程更新脚本并立即重启"; then
+    warn "已取消更新"
+    return
+  fi
 
   # 创建备份
   local self_path
@@ -534,9 +561,7 @@ update_self() {
       ok "脚本已更新"
 
       # 询问是否重新加载脚本
-      ask "是否立即重新加载脚本？(y/N): "
-      read -r reload_choice
-      if [[ "$reload_choice" =~ ^[Yy]$ ]]; then
+      if confirm "是否立即重新加载脚本"; then
         echo "🔄 重新加载脚本..."
         rm -f "$backup_path"   # ✅ 立即删除备份
         exec "$self_path"
@@ -568,19 +593,20 @@ purge_cron() {
 }
 
 uninstall_menu() {
-  echo "a) 仅删除本脚本（保留 acme.sh、证书、凭据、cron）"
-  echo "b) 完全卸载（删除 acme.sh、证书、凭据、cron 与本脚本）"
+  echo " [1] 仅删除本脚本（保留 acme.sh、证书、凭据、cron）"
+  echo " [2] 完全卸载（删除 acme.sh、证书、凭据、cron 与本脚本）"
   ask "选择: "
   read -r s
   case "$s" in
-    a|A)
+    1)
       rm -f -- "$(self_path)"
       ok "已删除本脚本"
       ;;
-    b|B)
-      ask "危险操作，确认完全卸载? (yes/NO): "
-      read -r y
-      [[ "$y" == "yes" ]] || { warn "已取消"; return; }
+    2)
+      if ! confirm "危险操作，确认完全卸载"; then
+        warn "已取消"
+        return
+      fi
       purge_cron
       rm -f -- "$CRON_WRAPPER"
       rm -rf -- "$OUT_DIR_BASE_DEFAULT" "$CRED_FILE" "$ACME_HOME"
@@ -596,17 +622,17 @@ main_menu() {
   while true; do
     echo
     echo "======== cert-easy ========"
-    echo " 1) 申请/续期证书 (DNS-01)"
-    echo " 2) 列出已管理证书"
-    echo " 3) 显示某域名证书路径"
-    echo " 4) 删除证书（可选吊销并移出续期清单）"
-    echo " 5) 自动续期开关 / 状态：$(cron_status)"
-    echo " 6) 凭据管理：新增/更新"
-    echo " 7) 凭据管理：删除（删除前列出依赖域名）"
-    echo " 8) 设置：重载命令 / 默认密钥长度 / 证书目录"
-    echo " 9) 更新脚本（从远程拉取并重启）"
-    echo "10) 卸载（一级/二级）"
-    echo " 0) 退出"
+    echo " [1] 申请/续期证书 (DNS-01)"
+    echo " [2] 列出已管理证书"
+    echo " [3] 显示某域名证书路径"
+    echo " [4] 删除证书（可选吊销并移出续期清单）"
+    echo " [5] 自动续期开关 / 状态：$(cron_status)"
+    echo " [6] 凭据管理：新增/更新"
+    echo " [7] 凭据管理：删除（删除前列出依赖域名）"
+    echo " [8] 设置：重载命令 / 默认密钥长度 / 证书目录"
+    echo " [9] 更新脚本（从远程拉取并重启）"
+    echo "[10] 卸载（一级/二级）"
+    echo " [0] 退出"
     ask "请选择操作: "
     read -r op
     case "$op" in
@@ -617,17 +643,19 @@ main_menu() {
       5) toggle_auto_renew ;;
       6) add_or_update_creds ;;
       7) delete_provider_creds ;;
-      8) echo "  a) 设置重载命令"
-         echo "  b) 设置默认密钥长度"
-         echo "  c) 设置证书根目录"
-         ask "选择: "
-         read -r s
-         case "$s" in
-           a) set_reload_cmd ;;
-           b) set_keylen_default ;;
-           c) set_outdir_base ;;
-           *) warn "无效选择" ;;
-         esac ;;
+      8)
+        echo " [1] 设置重载命令"
+        echo " [2] 设置默认密钥长度"
+        echo " [3] 设置证书根目录"
+        ask "选择: "
+        read -r s
+        case "$s" in
+          1) set_reload_cmd ;;
+          2) set_keylen_default ;;
+          3) set_outdir_base ;;
+          *) warn "无效选择" ;;
+        esac
+        ;;
       9) update_self ;;
       10) uninstall_menu ;;
       0) echo -e "\033[1;32m[✔]\033[0m 已退出。下次使用请输入: sudo cert-easy"; exit 0 ;;
