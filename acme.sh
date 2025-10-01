@@ -7,7 +7,7 @@ set -Eeuo pipefail
 # ===== 基础路径与默认值 =====
 SCRIPT_URL="${CERT_EASY_REMOTE_URL:-https://raw.githubusercontent.com/Lanlan13-14/Cert-Easy/refs/heads/main/acme.sh}"
 
-CRED_FILE="/root/.acme-cred"
+CRED_FILE="${HOME}/.acme-cred"  # 改成用户家目录，避免非 root 权限问题
 ACME_HOME="${HOME}/.acme.sh"
 ACME="${ACME_HOME}/acme.sh"
 OUT_DIR_BASE_DEFAULT="/etc/ssl/acme"
@@ -79,13 +79,18 @@ confirm() {
 touch_if_absent() {
   if [[ ! -f "$1" ]]; then
     umask 077
-    touch "$1"
+    if ! touch "$1"; then
+      warn "无法创建文件 $1 (权限问题？试试 sudo)"
+      return 1
+    fi
     chmod 600 "$1"
   fi
 }
 
 load_config() {
-  touch_if_absent "$CRED_FILE"
+  if ! touch_if_absent "$CRED_FILE"; then
+    err "配置文件 $CRED_FILE 创建失败"
+  fi
   set -a
   # shellcheck disable=SC1090
   source "$CRED_FILE"
@@ -97,9 +102,14 @@ load_config() {
 }
 save_kv() {
   local k="$1" v="$2"
-  touch_if_absent "$CRED_FILE"
+  if ! touch_if_absent "$CRED_FILE"; then
+    err "配置文件 $CRED_FILE 操作失败"
+  fi
   if grep -qE "^${k}=" "$CRED_FILE"; then
-    sed -i -E "s|^${k}=.*|${k}=${v//|/\\|}|" "$CRED_FILE"
+    if ! sed -i -E "s|^${k}=.*|${k}=${v//|/\\|}|" "$CRED_FILE"; then
+      warn "更新 $k 失败 (权限？)"
+      return 1
+    fi
   else
     echo "${k}=${v}" >>"$CRED_FILE"
   fi
@@ -110,11 +120,11 @@ init_minimal() {
   if [[ -z "${EMAIL}" ]]; then
     ask "📧 首次使用，输入 ACME 账号邮箱: "
     read -r EMAIL
-    save_kv EMAIL "$EMAIL"
+    save_kv EMAIL "$EMAIL" || err "保存 EMAIL 失败"
   fi
-  save_kv OUT_DIR_BASE "$OUT_DIR_BASE"
-  save_kv KEYLEN_DEFAULT "$KEYLEN_DEFAULT"
-  save_kv AUTO_RENEW "$AUTO_RENEW"
+  save_kv OUT_DIR_BASE "$OUT_DIR_BASE" || true
+  save_kv KEYLEN_DEFAULT "$KEYLEN_DEFAULT" || true
+  save_kv AUTO_RENEW "$AUTO_RENEW" || true
 }
 
 # ===== acme.sh 安装 =====
@@ -130,10 +140,10 @@ ensure_acme() {
 has_crontab() { command -v crontab >/dev/null 2>&1; }
 
 ensure_cron_wrapper() {
-  cat >"$CRON_WRAPPER" <<'EOF'
+  if ! cat >"$CRON_WRAPPER" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-CRED_FILE="/root/.acme-cred"
+CRED_FILE="'${CRED_FILE}'"
 ACME_HOME="$HOME/.acme.sh"
 ACME="${ACME_HOME}/acme.sh"
 AUTO_RENEW_DEFAULT="1"
@@ -147,12 +157,16 @@ if [[ "$AUTO_RENEW" = "1" ]]; then
 fi
 exit 0
 EOF
+  then
+    warn "无法创建 cron wrapper $CRON_WRAPPER (权限？)"
+    return 1
+  fi
   chmod 755 "$CRON_WRAPPER"
 }
 
 ensure_cron_job() {
   has_crontab || { warn "未检测到 crontab，跳过计划任务安装"; return 0; }
-  ensure_cron_wrapper
+  ensure_cron_wrapper || return 1
   local cr; cr="$(crontab -l 2>/dev/null || true)"
   local line="7 3 * * * $CRON_WRAPPER # cert-easy"
   if ! echo "$cr" | grep -qF "$CRON_WRAPPER"; then
@@ -183,7 +197,7 @@ toggle_auto_renew() {
     action="开启自动续期"
   fi
   if confirm "AUTO_RENEW=${AUTO_RENEW}，是否 ${action}"; then
-    save_kv AUTO_RENEW "$((${AUTO_RENEW:-0} ^ 1))"
+    save_kv AUTO_RENEW "$((${AUTO_RENEW:-0} ^ 1))" || warn "保存 AUTO_RENEW 失败"
     ok "已${action==*"开启"* && "开启" || "关闭"}自动续期"
   fi
   ensure_cron_job
@@ -271,45 +285,45 @@ add_or_update_creds() {
         ask "输入 CF_Token: "
         read -r t
         [[ -n "$t" ]] || { warn "输入为空"; return 1; }
-        save_kv CF_Token "$t"
-        sed -i -E '/^(CF_Key|CF_Email)=/d' "$CRED_FILE"
+        save_kv CF_Token "$t" || return 1
+        sed -i -E '/^(CF_Key|CF_Email)=/d' "$CRED_FILE" || warn "清理旧 CF 凭据失败"
       else
         ask "输入 CF_Key (Global API Key): "; read -r k
         ask "输入 CF_Email: "; read -r m
         [[ -n "$k" && -n "$m" ]] || { warn "输入不完整"; return 1; }
-        save_kv CF_Key "$k"; save_kv CF_Email "$m"
-        sed -i -E '/^CF_Token=/d' "$CRED_FILE"
+        save_kv CF_Key "$k" || return 1; save_kv CF_Email "$m" || return 1
+        sed -i -E '/^CF_Token=/d' "$CRED_FILE" || warn "清理旧 CF_Token 失败"
       fi
       ;;
     dnspod-cn)
       ask "输入 DP_Id: "; read -r id
       ask "输入 DP_Key: "; read -r key
       [[ -n "$id" && -n "$key" ]] || { warn "输入不完整"; return 1; }
-      save_kv DP_Id "$id"; save_kv DP_Key "$key"; save_kv DP_ENDPOINT "https://dnsapi.cn"
+      save_kv DP_Id "$id" || return 1; save_kv DP_Key "$key" || return 1; save_kv DP_ENDPOINT "https://dnsapi.cn" || return 1
       ;;
     dnspod-global)
       ask "输入 DP_Id: "; read -r id
       ask "输入 DP_Key: "; read -r key
       [[ -n "$id" && -n "$key" ]] || { warn "输入不完整"; return 1; }
-      save_kv DP_Id "$id"; save_kv DP_Key "$key"; save_kv DP_ENDPOINT "https://api.dnspod.com"
+      save_kv DP_Id "$id" || return 1; save_kv DP_Key "$key" || return 1; save_kv DP_ENDPOINT "https://api.dnspod.com" || return 1
       ;;
     aliyun-cn|aliyun-global)
       ask "输入 Ali_Key: "; read -r ak
       ask "输入 Ali_Secret: "; read -r sk
       [[ -n "$ak" && -n "$sk" ]] || { warn "输入不完整"; return 1; }
-      save_kv Ali_Key "$ak"; save_kv Ali_Secret "$sk"
+      save_kv Ali_Key "$ak" || return 1; save_kv Ali_Secret "$sk" || return 1
       ;;
     dynv6)
       ask "输入 DYNV6_TOKEN: "; read -r dv
       [[ -n "$dv" ]] || { warn "输入为空"; return 1; }
-      save_kv DYNV6_TOKEN "$dv"
+      save_kv DYNV6_TOKEN "$dv" || return 1
       ;;
     volcengine)
       ask "输入 VOLCENGINE_ACCESS_KEY: "; read -r v1
       ask "输入 VOLCENGINE_SECRET_KEY: "; read -r v2
       ask "区域(默认 cn-beijing): "; read -r rg; rg=${rg:-cn-beijing}
       [[ -n "$v1" && -n "$v2" ]] || { warn "输入不完整"; return 1; }
-      save_kv VOLCENGINE_ACCESS_KEY "$v1"; save_kv VOLCENGINE_SECRET_KEY "$v2"; save_kv VOLCENGINE_REGION "$rg"
+      save_kv VOLCENGINE_ACCESS_KEY "$v1" || return 1; save_kv VOLCENGINE_SECRET_KEY "$v2" || return 1; save_kv VOLCENGINE_REGION "$rg" || return 1
       ;;
     huaweicloud-cn|huaweicloud-global)
       ask "输入 HUAWEICLOUD_Username: "; read -r username
@@ -318,16 +332,16 @@ add_or_update_creds() {
       ask "输入 HUAWEICLOUD_IdentityEndpoint (默认 https://iam.myhuaweicloud.com): "; read -r endpoint
       endpoint="${endpoint:-https://iam.myhuaweicloud.com}"
       [[ -n "$username" && -n "$password" && -n "$projectid" ]] || { warn "输入不完整"; return 1; }
-      save_kv HUAWEICLOUD_Username "$username"
-      save_kv HUAWEICLOUD_Password "$password"
-      save_kv HUAWEICLOUD_ProjectID "$projectid"
-      save_kv HUAWEICLOUD_IdentityEndpoint "$endpoint"
+      save_kv HUAWEICLOUD_Username "$username" || return 1
+      save_kv HUAWEICLOUD_Password "$password" || return 1
+      save_kv HUAWEICLOUD_ProjectID "$projectid" || return 1
+      save_kv HUAWEICLOUD_IdentityEndpoint "$endpoint" || return 1
       ;;
     baidu)
       ask "输入 BAIDU_AK: "; read -r ak
       ask "输入 BAIDU_SK: "; read -r sk
       [[ -n "$ak" && -n "$sk" ]] || { warn "输入不完整"; return 1; }
-      save_kv BAIDU_AK "$ak"; save_kv BAIDU_SK "$sk"
+      save_kv BAIDU_AK "$ak" || return 1; save_kv BAIDU_SK "$sk" || return 1
       ;;
   esac
   ok "凭据已写入 $CRED_FILE"
@@ -406,7 +420,7 @@ delete_provider_creds() {
 
   local keys; keys=$(provider_env_keys "$p")
   for k in $keys; do
-    sed -i -E "/^${k}=.*/d" "$CRED_FILE"
+    sed -i -E "/^${k}=.*/d" "$CRED_FILE" || warn "删除 $k 失败"
   done
   ok "已从 $CRED_FILE 删除 $label 的凭据"
 }
@@ -520,21 +534,21 @@ set_reload_cmd() {
   load_config
   ask "输入安装/续期后执行的重载命令（如 systemctl reload nginx，留空清除）: "
   read -r rc
-  save_kv RELOAD_CMD "$rc"
+  save_kv RELOAD_CMD "$rc" || warn "保存 RELOAD_CMD 失败"
   if [[ -n "$rc" ]]; then ok "已设置重载命令：$rc"; else ok "已清空重载命令"; fi
 }
 set_keylen_default() {
   load_config
   ask "设置默认密钥长度 (ec-256/ec-384/2048/3072/4096): "
   read -r k
-  save_kv KEYLEN_DEFAULT "$k"
+  save_kv KEYLEN_DEFAULT "$k" || warn "保存 KEYLEN_DEFAULT 失败"
   ok "默认密钥长度已设为 $k"
 }
 set_outdir_base() {
   load_config
   ask "设置证书根目录 [当前 ${OUT_DIR_BASE}]: "
   read -r o
-  [[ -n "$o" ]] && save_kv OUT_DIR_BASE "$o" && ok "证书根目录设为 $o"
+  [[ -n "$o" ]] && save_kv OUT_DIR_BASE "$o" && ok "证书根目录设为 $o" || warn "设置 OUT_DIR_BASE 失败"
 }
 
 # ===== 更新与卸载 =====
@@ -566,7 +580,7 @@ update_self() {
         rm -f "$backup_path"   # ✅ 立即删除备份
         exec "$self_path"
       else
-        echo "ℹ️  下次使用请输入: sudo cert-easy"
+        echo "ℹ️  下次使用请输入: cert-easy"  # 去掉 sudo，如果非 root
         rm -f "$backup_path"   # ✅ 不重启也会删除备份
         ok "已删除备份: $backup_path"
       fi
@@ -658,7 +672,7 @@ main_menu() {
         ;;
       9) update_self ;;
       10) uninstall_menu ;;
-      0) echo -e "\033[1;32m[✔]\033[0m 已退出。下次使用请输入: sudo cert-easy"; exit 0 ;;
+      0) echo -e "\033[1;32m[✔]\033[0m 已退出。下次使用请输入: cert-easy"; exit 0 ;;
       *) warn "无效选择" ;;
     esac
   done
