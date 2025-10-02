@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cert-easy: 交互式 DNS-01 证书申请/管理，支持 Cloudflare / DNSPod(CN&Global) / 阿里云(CN&Global) / dynv6 / 火山引擎 / 华为云(CN) / 百度云
 # 功能：申请/安装、列出/查看/删除证书；凭据新增/删除（删除前提示依赖域名）；温和的自动续期策略；更新脚本；两级卸载
-# 依赖：bash、curl、openssl、crontab(可选)
+# 支持：CentOS, Debian, Ubuntu, Alpine, Arch Linux
 set -Eeuo pipefail
 
 # ===== 基础路径与默认值 =====
@@ -15,6 +15,103 @@ KEYLEN_DEFAULT="ec-256"            # ec-256 | ec-384 | 2048 | 3072 | 4096
 AUTO_RENEW_DEFAULT="1"             # 1=开启自动续期；0=关闭但保留 cron 任务
 CRON_WRAPPER="/usr/local/bin/cert-easy-cron"
 
+# ===== 系统检测和依赖管理 =====
+detect_os() {
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        OS_NAME="$ID"
+        OS_VERSION="$VERSION_ID"
+    elif [[ -f /etc/centos-release ]]; then
+        OS_NAME="centos"
+        OS_VERSION=$(grep -oE '[0-9]+\.[0-9]+' /etc/centos-release | head -1)
+    elif [[ -f /etc/debian_version ]]; then
+        OS_NAME="debian"
+        OS_VERSION=$(cat /etc/debian_version)
+    elif [[ -f /etc/alpine-release ]]; then
+        OS_NAME="alpine"
+        OS_VERSION=$(cat /etc/alpine-release)
+    elif [[ -f /etc/arch-release ]]; then
+        OS_NAME="arch"
+        OS_VERSION=""  # Arch 是滚动版本
+    else
+        err "无法检测操作系统类型"
+    fi
+}
+
+install_dependencies() {
+    local pkg_manager=""
+    local curl_pkg="curl"
+    local openssl_pkg="openssl"
+    local cron_pkg=""
+    
+    case "$OS_NAME" in
+        centos|rhel|fedora)
+            if command -v dnf >/dev/null 2>&1; then
+                pkg_manager="dnf -y"
+            else
+                pkg_manager="yum -y"
+            fi
+            cron_pkg="cronie"
+            ;;
+        debian|ubuntu)
+            pkg_manager="apt-get -y"
+            cron_pkg="cron"
+            # 更新包列表
+            $pkg_manager update >/dev/null 2>&1 || true
+            ;;
+        alpine)
+            pkg_manager="apk add"
+            curl_pkg="curl"
+            openssl_pkg="openssl"
+            cron_pkg="dcron"
+            # Alpine 需要先更新索引
+            $pkg_manager update >/dev/null 2>&1 || true
+            ;;
+        arch)
+            pkg_manager="pacman -S --noconfirm --needed"
+            curl_pkg="curl"
+            openssl_pkg="openssl"
+            cron_pkg="cronie"
+            ;;
+        *)
+            err "不支持的操作系统: $OS_NAME"
+            ;;
+    esac
+
+    # 安装依赖
+    local to_install=()
+    
+    if ! command -v curl >/dev/null 2>&1; then
+        to_install+=("$curl_pkg")
+    fi
+    
+    if ! command -v openssl >/dev/null 2>&1; then
+        to_install+=("$openssl_pkg")
+    fi
+    
+    # 对于crontab，我们检查命令是否存在，如果不存在且知道包名则安装
+    if ! command -v crontab >/dev/null 2>&1 && [[ -n "$cron_pkg" ]]; then
+        to_install+=("$cron_pkg")
+    fi
+    
+    if [[ ${#to_install[@]} -gt 0 ]]; then
+        ok "安装依赖: ${to_install[*]}"
+        if [[ "$OS_NAME" == "alpine" ]]; then
+            $pkg_manager ${to_install[@]} >/dev/null 2>&1 || {
+                warn "部分依赖安装失败，尝试继续运行..."
+            }
+        else
+            $pkg_manager install ${to_install[@]} >/dev/null 2>&1 || {
+                warn "部分依赖安装失败，尝试继续运行..."
+            }
+        fi
+    fi
+    
+    # 再次检查关键依赖
+    ensure_cmd curl
+    ensure_cmd openssl
+}
+
 # ===== 样式 =====
 ok()   { echo -e "\033[1;32m[✔]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
@@ -23,8 +120,6 @@ ask()  { echo -ne "\033[1;36m[?]\033[0m $*"; }
 self_path(){ readlink -f "$0" 2>/dev/null || echo "$0"; }
 
 ensure_cmd(){ command -v "$1" >/dev/null 2>&1 || err "缺少依赖: $1"; }
-ensure_cmd curl
-ensure_cmd openssl
 
 # ===== 配置文件处理 =====
 touch_if_absent() {
@@ -57,6 +152,9 @@ save_kv() {
 }
 
 init_minimal() {
+  detect_os
+  install_dependencies
+  
   load_config
   if [[ -z "${EMAIL}" ]]; then
     ask "📧 首次使用，输入 ACME 账号邮箱: "
