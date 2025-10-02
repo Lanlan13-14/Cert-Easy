@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cert-easy: 交互式 DNS-01 证书申请/管理，支持 Cloudflare / DNSPod(CN&Global) / 阿里云(CN&Global) / dynv6 / 火山引擎 / 华为云(CN&Global) / 百度云
+# cert-easy: 交互式 DNS-01 证书申请/管理，支持 Cloudflare / DNSPod(CN&Global) / 阿里云(CN&Global) / dynv6 / 火山引擎 / 华为云(CN) / 百度云
 # 功能：申请/安装、列出/查看/删除证书；凭据新增/删除（删除前提示依赖域名）；温和的自动续期策略；更新脚本；两级卸载
 # 依赖：bash、curl、openssl、crontab(可选)
 set -Eeuo pipefail
@@ -140,19 +140,33 @@ toggle_auto_renew() {
 }
 
 # ===== 提供商相关 =====
-providers_menu() {
-  cat <<EOF
-可用 DNS 提供商:
-  - Cloudflare (cf)
-  - DNSPod 中国站 (dnspod-cn)
-  - DNSPod 国际站 (dnspod-global)
-  - 阿里云 中国/国际 (aliyun-cn / aliyun-global)
-  - dynv6 (dynv6)
-  - 火山引擎 Volcengine (volcengine)
-  - 华为云 中国站 (huaweicloud-cn)
-  - 华为云 国际站 (huaweicloud-global)
-  - 百度云 (baidu)
-EOF
+show_providers_menu() {
+  echo "请选择 DNS 提供商:"
+  echo "[1] Cloudflare (cf)"
+  echo "[2] DNSPod 中国站 (dnspod-cn)" 
+  echo "[3] DNSPod 国际站 (dnspod-global)"
+  echo "[4] 阿里云 中国站 (aliyun-cn)"
+  echo "[5] 阿里云 国际站 (aliyun-global)"
+  echo "[6] dynv6 (dynv6)"
+  echo "[7] 火山引擎 Volcengine (volcengine)"
+  echo "[8] 华为云 中国站 (huaweicloud-cn)"
+  echo "[9] 百度云 (baidu)"
+}
+
+get_provider_by_choice() {
+  local choice="$1"
+  case "$choice" in
+    1) echo "cf" ;;
+    2) echo "dnspod-cn" ;;
+    3) echo "dnspod-global" ;;
+    4) echo "aliyun-cn" ;;
+    5) echo "aliyun-global" ;;
+    6) echo "dynv6" ;;
+    7) echo "volcengine" ;;
+    8) echo "huaweicloud-cn" ;;
+    9) echo "baidu" ;;
+    *) return 1 ;;
+  esac
 }
 
 provider_to_dnsapi() {
@@ -163,7 +177,6 @@ provider_to_dnsapi() {
     dynv6)                    echo "dns_dynv6" ;;
     volcengine)               echo "dns_volcengine" ;;
     huaweicloud-cn)           echo "dns_huaweicloud" ;;
-    huaweicloud-global)       echo "dns_huaweicloud" ;;
     baidu)                    echo "dns_baidu" ;;
     *) return 1 ;;
   esac
@@ -210,13 +223,6 @@ export_provider_env() {
       export HUAWEICLOUD_Username HUAWEICLOUD_Password HUAWEICLOUD_ProjectID
       export HUAWEICLOUD_IdentityEndpoint="${HUAWEICLOUD_IdentityEndpoint:-https://iam.myhuaweicloud.com}"
       ;;
-    huaweicloud-global)
-      : "${HUAWEICLOUD_Username:?缺少 HUAWEICLOUD_Username}"
-      : "${HUAWEICLOUD_Password:?缺少 HUAWEICLOUD_Password}"
-      : "${HUAWEICLOUD_ProjectID:?缺少 HUAWEICLOUD_ProjectID}"
-      export HUAWEICLOUD_Username HUAWEICLOUD_Password HUAWEICLOUD_ProjectID
-      export HUAWEICLOUD_IdentityEndpoint="${HUAWEICLOUD_IdentityEndpoint:-https://iam.myhuaweicloud.com}"
-      ;;
     baidu)
       : "${BAIDU_AK:?缺少 BAIDU_AK}"
       : "${BAIDU_SK:?缺少 BAIDU_SK}"
@@ -228,9 +234,11 @@ export_provider_env() {
 
 add_or_update_creds() {
   load_config
-  providers_menu
-  ask "选择提供商代号 (cf/dnspod-cn/dnspod-global/aliyun-cn/aliyun-global/dynv6/volcengine/huaweicloud-cn/huaweicloud-global/baidu): "
-  read -r p
+  show_providers_menu
+  ask "选择提供商编号 (1-9): "
+  read -r choice
+  local p; p=$(get_provider_by_choice "$choice") || { warn "无效选择"; return 1; }
+  
   case "$p" in
     cf)
       ask "优先推荐 CF_Token。输入 CF_Token (留空则改为 CF_Key/CF_Email): "
@@ -281,17 +289,6 @@ add_or_update_creds() {
       save_kv HUAWEICLOUD_ProjectID "$projectid"
       save_kv HUAWEICLOUD_IdentityEndpoint "$endpoint"
       ;;
-    huaweicloud-global)
-      ask "输入 HUAWEICLOUD_Username: "; read -r username
-      ask "输入 HUAWEICLOUD_Password: "; read -r password
-      ask "输入 HUAWEICLOUD_ProjectID: "; read -r projectid
-      ask "输入 HUAWEICLOUD_IdentityEndpoint (默认 https://iam.myhuaweicloud.com): "; read -r endpoint
-      endpoint="${endpoint:-https://iam.myhuaweicloud.com}"
-      save_kv HUAWEICLOUD_Username "$username"
-      save_kv HUAWEICLOUD_Password "$password"
-      save_kv HUAWEICLOUD_ProjectID "$projectid"
-      save_kv HUAWEICLOUD_IdentityEndpoint "$endpoint"
-      ;;
     baidu)
       ask "输入 BAIDU_AK: "; read -r ak
       ask "输入 BAIDU_SK: "; read -r sk
@@ -309,7 +306,7 @@ provider_env_keys() {
     aliyun-cn|aliyun-global) echo "Ali_Key Ali_Secret" ;;
     dynv6) echo "DYNV6_TOKEN" ;;
     volcengine) echo "VOLCENGINE_ACCESS_KEY VOLCENGINE_SECRET_KEY VOLCENGINE_REGION" ;;
-    huaweicloud-cn|huaweicloud-global) echo "HUAWEICLOUD_Username HUAWEICLOUD_Password HUAWEICLOUD_ProjectID HUAWEICLOUD_IdentityEndpoint" ;;
+    huaweicloud-cn) echo "HUAWEICLOUD_Username HUAWEICLOUD_Password HUAWEICLOUD_ProjectID HUAWEICLOUD_IdentityEndpoint" ;;
     baidu) echo "BAIDU_AK BAIDU_SK" ;;
   esac
 }
@@ -336,14 +333,15 @@ scan_provider_usage() {
 
 delete_provider_creds() {
   load_config
-  providers_menu
-  ask "选择要删除凭据的提供商 (cf/dnspod-cn/dnspod-global/aliyun-cn/aliyun-global/dynv6/volcengine/huaweicloud-cn/huaweicloud-global/baidu): "
-  read -r p
+  show_providers_menu
+  ask "选择要删除凭据的提供商编号 (1-9): "
+  read -r choice
+  local p; p=$(get_provider_by_choice "$choice") || { warn "无效选择"; return 1; }
   local label="$p" short="$p"
   case "$p" in
     dnspod-cn|dnspod-global) short="dnspod" ;;
     aliyun-cn|aliyun-global) short="aliyun" ;;
-    huaweicloud-cn|huaweicloud-global) short="huaweicloud" ;;
+    huaweicloud-cn) short="huaweicloud" ;;
   esac
   local inuse=()
   while IFS=$'\t' read -r prov dom; do
@@ -384,8 +382,12 @@ delete_provider_creds() {
 
 # ===== 证书申请/安装 =====
 prompt_issue_params() {
-  ask "🌐 选择提供商 (cf/dnspod-cn/dnspod-global/aliyun-cn/aliyun-global/dynv6/volcengine/huaweicloud-cn/huaweicloud-global/baidu): "
-  read -r PROVIDER
+  show_providers_menu
+  ask "选择提供商编号 (1-9): "
+  read -r choice
+  local p; p=$(get_provider_by_choice "$choice") || { warn "无效选择"; return 1; }
+  PROVIDER="$p"
+  
   ask "📛 主域名 (如 example.com): "
   read -r DOMAIN
   echo "提示：通配符 *.${DOMAIN} 可覆盖 www/api 等所有一级子域，需 DNS-01 验证。"
@@ -596,17 +598,17 @@ main_menu() {
   while true; do
     echo
     echo "======== cert-easy ========"
-    echo " 1) 申请/续期证书 (DNS-01)"
-    echo " 2) 列出已管理证书"
-    echo " 3) 显示某域名证书路径"
-    echo " 4) 删除证书（可选吊销并移出续期清单）"
-    echo " 5) 自动续期开关 / 状态：$(cron_status)"
-    echo " 6) 凭据管理：新增/更新"
-    echo " 7) 凭据管理：删除（删除前列出依赖域名）"
-    echo " 8) 设置：重载命令 / 默认密钥长度 / 证书目录"
-    echo " 9) 更新脚本（从远程拉取并重启）"
-    echo "10) 卸载（一级/二级）"
-    echo " 0) 退出"
+    echo "[1] 申请/续期证书 (DNS-01)"
+    echo "[2] 列出已管理证书"
+    echo "[3] 显示某域名证书路径"
+    echo "[4] 删除证书（可选吊销并移出续期清单）"
+    echo "[5] 自动续期开关 / 状态：$(cron_status)"
+    echo "[6] 凭据管理：新增/更新"
+    echo "[7] 凭据管理：删除（删除前列出依赖域名）"
+    echo "[8] 设置：重载命令 / 默认密钥长度 / 证书目录"
+    echo "[9] 更新脚本（从远程拉取并重启）"
+    echo "[10] 卸载（一级/二级）"
+    echo "[0] 退出"
     ask "请选择操作: "
     read -r op
     case "$op" in
@@ -617,15 +619,17 @@ main_menu() {
       5) toggle_auto_renew ;;
       6) add_or_update_creds ;;
       7) delete_provider_creds ;;
-      8) echo "  a) 设置重载命令"
-         echo "  b) 设置默认密钥长度"
-         echo "  c) 设置证书根目录"
+      8) echo "  [1] 设置重载命令"
+         echo "  [2] 设置默认密钥长度"
+         echo "  [3] 设置证书根目录"
+         echo "  [0] 返回上级"
          ask "选择: "
          read -r s
          case "$s" in
-           a) set_reload_cmd ;;
-           b) set_keylen_default ;;
-           c) set_outdir_base ;;
+           1) set_reload_cmd ;;
+           2) set_keylen_default ;;
+           3) set_outdir_base ;;
+           0) ;;
            *) warn "无效选择" ;;
          esac ;;
       9) update_self ;;
