@@ -17,6 +17,9 @@ CRON_WRAPPER="/usr/local/bin/cert-easy-cron"
 # IP证书相关配置
 VALIDATION_WEBROOT_DEFAULT="/wwwroot/letsencrypt"
 IP_CERT_DAYS_DEFAULT="6"           # IP证书默认有效期6天
+# 自签证书默认值
+SELF_SIGN_DAYS_DEFAULT="365"       # 自签证书默认有效期1年
+SELF_SIGN_KEYLEN_DEFAULT="2048"    # 自签证书默认密钥长度
 
 # ===== 系统检测和依赖管理 =====
 detect_os() {
@@ -46,7 +49,7 @@ install_dependencies() {
     local curl_pkg="curl"
     local openssl_pkg="openssl"
     local cron_pkg=""
-    
+
     case "$OS_NAME" in
         centos|rhel|fedora)
             if command -v dnf >/dev/null 2>&1; then
@@ -83,20 +86,20 @@ install_dependencies() {
 
     # 安装依赖
     local to_install=()
-    
+
     if ! command -v curl >/dev/null 2>&1; then
         to_install+=("$curl_pkg")
     fi
-    
+
     if ! command -v openssl >/dev/null 2>&1; then
         to_install+=("$openssl_pkg")
     fi
-    
+
     # 对于crontab，我们检查命令是否存在，如果不存在且知道包名则安装
     if ! command -v crontab >/dev/null 2>&1 && [[ -n "$cron_pkg" ]]; then
         to_install+=("$cron_pkg")
     fi
-    
+
     if [[ ${#to_install[@]} -gt 0 ]]; then
         ok "安装依赖: ${to_install[*]}"
         if [[ "$OS_NAME" == "alpine" ]]; then
@@ -109,7 +112,7 @@ install_dependencies() {
             }
         fi
     fi
-    
+
     # 再次检查关键依赖
     ensure_cmd curl
     ensure_cmd openssl
@@ -145,6 +148,8 @@ load_config() {
   AUTO_RENEW="${AUTO_RENEW:-$AUTO_RENEW_DEFAULT}"
   VALIDATION_WEBROOT="${VALIDATION_WEBROOT:-$VALIDATION_WEBROOT_DEFAULT}"
   IP_CERT_DAYS="${IP_CERT_DAYS:-$IP_CERT_DAYS_DEFAULT}"
+  SELF_SIGN_DAYS="${SELF_SIGN_DAYS:-$SELF_SIGN_DAYS_DEFAULT}"
+  SELF_SIGN_KEYLEN="${SELF_SIGN_KEYLEN:-$SELF_SIGN_KEYLEN_DEFAULT}"
 }
 save_kv() {
   local k="$1" v="$2"
@@ -159,7 +164,7 @@ save_kv() {
 init_minimal() {
   detect_os
   install_dependencies
-  
+
   load_config
   if [[ -z "${EMAIL}" ]]; then
     ask "📧 首次使用，输入 ACME 账号邮箱: "
@@ -171,6 +176,8 @@ init_minimal() {
   save_kv AUTO_RENEW "$AUTO_RENEW"
   save_kv VALIDATION_WEBROOT "$VALIDATION_WEBROOT"
   save_kv IP_CERT_DAYS "$IP_CERT_DAYS"
+  save_kv SELF_SIGN_DAYS "$SELF_SIGN_DAYS"
+  save_kv SELF_SIGN_KEYLEN "$SELF_SIGN_KEYLEN"
 }
 
 # ===== acme.sh 安装 =====
@@ -343,7 +350,7 @@ add_or_update_creds() {
   ask "选择提供商编号 (1-9): "
   read -r choice
   local p; p=$(get_provider_by_choice "$choice") || { warn "无效选择"; return 1; }
-  
+
   case "$p" in
     cf)
       ask "优先推荐 CF_Token。输入 CF_Token (留空则改为 CF_Key/CF_Email): "
@@ -495,7 +502,7 @@ get_public_ipv4() {
     "https://icanhazip.com"
     "https://checkip.amazonaws.com"
   )
-  
+
   for service in "${services[@]}"; do
     if ip=$(curl -4 -s --connect-timeout 5 "$service" 2>/dev/null); then
       # 验证IP地址格式
@@ -505,7 +512,7 @@ get_public_ipv4() {
       fi
     fi
   done
-  
+
   return 1
 }
 
@@ -515,7 +522,7 @@ get_public_ipv6() {
     "https://api64.ipify.org"
     "https://icanhazip.com"
   )
-  
+
   for service in "${services[@]}"; do
     if ip=$(curl -6 -s --connect-timeout 5 "$service" 2>/dev/null); then
       # 简单验证IPv6格式
@@ -525,7 +532,7 @@ get_public_ipv6() {
       fi
     fi
   done
-  
+
   return 1
 }
 
@@ -533,14 +540,14 @@ get_public_ipv6() {
 detect_web_server_user() {
   # 尝试检测Web服务器用户
   local user=""
-  
+
   # 检查Nginx用户
   if command -v nginx >/dev/null 2>&1; then
     if nginx -T 2>/dev/null | grep -q "user "; then
       user=$(nginx -T 2>/dev/null | grep "user " | head -1 | awk '{print $2}' | tr -d ';')
     fi
   fi
-  
+
   # 如果没找到，尝试常见用户
   if [[ -z "$user" ]]; then
     for test_user in www-data nginx apache http; do
@@ -550,21 +557,21 @@ detect_web_server_user() {
       fi
     done
   fi
-  
+
   echo "${user:-www-data}"
 }
 
 create_webroot_directory() {
   local webroot="$1"
-  
+
   # 创建目录结构
   mkdir -p "${webroot}/.well-known/acme-challenge"
   mkdir -p "${webroot}/.well-known/pki-validation"
-  
+
   # 获取Web服务器用户
   local web_user
   web_user=$(detect_web_server_user)
-  
+
   # 设置权限
   chmod -R 755 "$webroot"
   if chown -R "${web_user}:${web_user}" "$webroot" 2>/dev/null; then
@@ -577,22 +584,22 @@ create_webroot_directory() {
 configure_nginx_automatically() {
   local webroot="$1"
   local nginx_config="/etc/nginx/sites-available/default"
-  
+
   # 检查是否有其他Nginx配置文件
   if [[ ! -f "$nginx_config" ]]; then
     nginx_config="/etc/nginx/nginx.conf"
   fi
-  
+
   ask "Nginx 配置文件路径 [默认: ${nginx_config}]: "
   read -r custom_config
   nginx_config="${custom_config:-$nginx_config}"
-  
+
   # 备份原配置文件
   if [[ -f "$nginx_config" ]]; then
     cp "$nginx_config" "${nginx_config}.bak-$(date +%Y%m%d%H%M%S)"
     ok "已备份原配置文件到 ${nginx_config}.bak"
   fi
-  
+
   # 创建配置文件
   cat > "$nginx_config" <<EOF
 server {
@@ -615,9 +622,9 @@ server {
     }
 }
 EOF
-  
+
   ok "已写入 Nginx 配置文件: ${nginx_config}"
-  
+
   # 测试配置
   if nginx -t; then
     ok "Nginx 配置测试成功"
@@ -635,17 +642,17 @@ EOF
 configure_caddy_automatically() {
   local webroot="$1"
   local caddy_config="/etc/caddy/Caddyfile"
-  
+
   ask "Caddy 配置文件路径 [默认: ${caddy_config}]: "
   read -r custom_config
   caddy_config="${custom_config:-$caddy_config}"
-  
+
   # 备份原配置文件
   if [[ -f "$caddy_config" ]]; then
     cp "$caddy_config" "${caddy_config}.bak-$(date +%Y%m%d%H%M%S)"
     ok "已备份原配置文件到 ${caddy_config}.bak"
   fi
-  
+
   # 创建配置文件
   cat > "$caddy_config" <<EOF
 :80 {
@@ -666,9 +673,9 @@ configure_caddy_automatically() {
     }
 }
 EOF
-  
+
   ok "已写入 Caddy 配置文件: ${caddy_config}"
-  
+
   # 测试配置
   if command -v caddy >/dev/null 2>&1; then
     if caddy validate --config "$caddy_config"; then
@@ -689,7 +696,7 @@ EOF
 
 show_web_server_manual_config() {
   local webroot="$1"
-  
+
   echo "=========================================="
   echo "📋 请手动配置您的 Web 服务器以支持 HTTP-01 验证"
   echo "=========================================="
@@ -718,7 +725,7 @@ server {
     }
 }
 NGINX_EXAMPLE
-  
+
   echo
   echo "📝 Caddy 配置示例:"
   cat <<CADDY_EXAMPLE
@@ -740,7 +747,7 @@ NGINX_EXAMPLE
     }
 }
 CADDY_EXAMPLE
-  
+
   echo
   echo "💡 配置完成后，请测试并重载 Web 服务器"
   echo "=========================================="
@@ -750,21 +757,153 @@ check_webroot_accessibility() {
   local webroot="$1"
   local ip_address="$2"
   local test_file="${webroot}/.well-known/acme-challenge/test"
-  
+
   # 创建测试文件
   mkdir -p "$(dirname "$test_file")"
   echo "test-content-$(date +%s)" > "$test_file"
   chmod 644 "$test_file"
-  
+
   # 尝试访问（使用 curl）
   if curl -s -f --connect-timeout 10 "http://${ip_address}/.well-known/acme-challenge/test" 2>/dev/null | grep -q "test-content"; then
     rm -f "$test_file"
     return 0
   fi
-  
+
   # 清理
   rm -f "$test_file"
   return 1
+}
+
+# ===== 自签证书生成函数 =====
+generate_self_signed_cert() {
+  load_config
+  
+  echo "📛 输入证书的主域名或标识 (如 example.com 或 cdn-backend): "
+  read -r DOMAIN
+  
+  ask "➕ 额外域名(逗号分隔，可空): "
+  read -r ALT
+  
+  ask "📅 证书有效期(天数) [默认 ${SELF_SIGN_DAYS}]: "
+  read -r days
+  days=${days:-$SELF_SIGN_DAYS}
+  
+  ask "🔑 密钥长度 [2048|3072|4096] [默认 ${SELF_SIGN_KEYLEN}]: "
+  read -r keylen
+  keylen=${keylen:-$SELF_SIGN_KEYLEN}
+  
+  ask "🏢 组织名称 (O) [默认: Cert-Easy Self-Signed]: "
+  read -r org
+  org=${org:-"Cert-Easy Self-Signed"}
+  
+  ask "📍 城市/地区 (L) [默认: Internet]: "
+  read -r city
+  city=${city:-"Internet"}
+  
+  ask "🌍 国家代码 (C) [默认: CN]: "
+  read -r country
+  country=${country:-"CN"}
+  
+  # 构建主题字符串
+  local subject="/C=${country}/L=${city}/O=${org}/CN=${DOMAIN}"
+  
+  # 构建SAN扩展
+  local san_list="DNS:${DOMAIN}"
+  if [[ -n "$ALT" ]]; then
+    IFS=',' read -r -a alt_domains <<< "$ALT"
+    for alt_domain in "${alt_domains[@]}"; do
+      alt_domain="$(echo "$alt_domain" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      if [[ -n "$alt_domain" ]]; then
+        san_list="${san_list},DNS:${alt_domain}"
+      fi
+    done
+  fi
+  
+  # 创建输出目录
+  local OUT_DIR="${OUT_DIR_BASE}/${DOMAIN}-selfsigned"
+  mkdir -p "$OUT_DIR"
+  chmod 700 "$OUT_DIR"
+  
+  # 生成私钥
+  ok "正在生成 ${keylen} 位 RSA 私钥..."
+  openssl genrsa -out "${OUT_DIR}/privkey.key" "${keylen}"
+  
+  # 生成CSR配置文件
+  local openssl_config="${OUT_DIR}/openssl.cnf"
+  cat > "$openssl_config" <<EOF
+[req]
+default_bits = ${keylen}
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+C = ${country}
+L = ${city}
+O = ${org}
+CN = ${DOMAIN}
+
+[v3_req]
+keyUsage = keyEncipherment, dataEncipherment, digitalSignature
+extendedKeyUsage = serverAuth, clientAuth
+subjectAltName = ${san_list}
+EOF
+  
+  # 生成CSR
+  ok "正在生成证书签名请求..."
+  openssl req -new -key "${OUT_DIR}/privkey.key" \
+    -out "${OUT_DIR}/cert.csr" \
+    -config "$openssl_config"
+  
+  # 生成自签证书
+  ok "正在生成自签证书 (有效期 ${days} 天)..."
+  openssl x509 -req -days "${days}" \
+    -in "${OUT_DIR}/cert.csr" \
+    -signkey "${OUT_DIR}/privkey.key" \
+    -out "${OUT_DIR}/cert.pem" \
+    -extfile "$openssl_config" \
+    -extensions v3_req
+  
+  # 生成链证书（自签证书的链就是它自己）
+  cp "${OUT_DIR}/cert.pem" "${OUT_DIR}/chain.pem"
+  cat "${OUT_DIR}/cert.pem" "${OUT_DIR}/chain.pem" > "${OUT_DIR}/fullchain.pem"
+  
+  # 设置权限
+  chmod 600 "${OUT_DIR}/privkey.key"
+  chmod 644 "${OUT_DIR}"/*.pem "${OUT_DIR}"/*.csr 2>/dev/null || true
+  chmod 644 "$openssl_config"
+  
+  # 清理临时文件
+  rm -f "${OUT_DIR}/cert.csr" "$openssl_config"
+  
+  ok "自签证书生成完成！"
+  echo "=========================================="
+  echo "证书信息:"
+  echo "  主域名: ${DOMAIN}"
+  if [[ -n "$ALT" ]]; then
+    echo "  备用域名: ${ALT}"
+  fi
+  echo "  有效期: ${days} 天"
+  echo "  密钥长度: ${keylen} bit"
+  echo ""
+  echo "📁 证书路径:"
+  echo "  - 私钥:        ${OUT_DIR}/privkey.key"
+  echo "  - 证书:        ${OUT_DIR}/cert.pem"
+  echo "  - 链证书:      ${OUT_DIR}/chain.pem"
+  echo "  - 全链:        ${OUT_DIR}/fullchain.pem"
+  echo ""
+  echo "📋 证书详细信息:"
+  openssl x509 -in "${OUT_DIR}/cert.pem" -text -noout | grep -E "Subject:|Issuer:|Not Before:|Not After :|DNS:"
+  echo "=========================================="
+  
+  # 询问是否安装重载命令
+  if [[ -n "${RELOAD_CMD:-}" ]]; then
+    ask "是否执行重载命令? (y/N): "
+    read -r do_reload
+    if [[ "$do_reload" =~ ^[Yy]$ ]]; then
+      eval "$RELOAD_CMD" && ok "重载命令执行成功" || warn "重载命令执行失败"
+    fi
+  fi
 }
 
 # ===== 证书申请/安装 =====
@@ -774,7 +913,7 @@ prompt_domain_cert_params() {
   read -r choice
   local p; p=$(get_provider_by_choice "$choice") || { warn "无效选择"; return 1; }
   PROVIDER="$p"
-  
+
   ask "📛 主域名 (如 example.com): "
   read -r DOMAIN
   echo "提示：通配符 *.${DOMAIN} 可覆盖 www/api 等所有一级子域，需 DNS-01 验证。"
@@ -790,26 +929,26 @@ prompt_domain_cert_params() {
 
 prompt_ip_cert_params() {
   load_config
-  
+
   # 自动获取公网IP
   echo "🌐 正在检测公网IP地址..."
-  
+
   local ipv4=""
   local ipv6=""
   local selected_ip=""
-  
+
   if ipv4=$(get_public_ipv4); then
     echo "✅ 检测到 IPv4: $ipv4"
   else
     warn "无法自动获取 IPv4 地址"
   fi
-  
+
   if ipv6=$(get_public_ipv6); then
     echo "✅ 检测到 IPv6: $ipv6"
   else
     warn "无法自动获取 IPv6 地址"
   fi
-  
+
   if [[ -n "$ipv4" ]] || [[ -n "$ipv6" ]]; then
     echo
     echo "请选择IP地址或手动输入:"
@@ -820,10 +959,10 @@ prompt_ip_cert_params() {
       echo "[2] 使用检测到的 IPv6: $ipv6"
     fi
     echo "[3] 手动输入IP地址"
-    
+
     ask "选择 (1-3): "
     read -r ip_choice
-    
+
     case "$ip_choice" in
       1)
         if [[ -n "$ipv4" ]]; then
@@ -857,33 +996,33 @@ prompt_ip_cert_params() {
     ask "🌐 输入 IP 地址: "
     read -r selected_ip
   fi
-  
+
   # 验证IP地址格式
   if [[ ! "$selected_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && [[ ! "$selected_ip" =~ : ]]; then
     err "无效的IP地址格式"
   fi
-  
+
   PUBLIC_IP="$selected_ip"
   DOMAIN="$selected_ip"  # 使用IP作为域名
-  
+
   ask "📁 验证文件根目录 [默认 ${VALIDATION_WEBROOT}]: "
   read -r webroot_input
   VALIDATION_WEBROOT="${webroot_input:-$VALIDATION_WEBROOT}"
-  
+
   ask "🔑 密钥长度 [默认 ${KEYLEN_DEFAULT}]: "
   read -r KEYLEN; KEYLEN=${KEYLEN:-$KEYLEN_DEFAULT}
-  
+
   ask "🧪 使用测试环境(避免频率限制)? (y/N): "
   read -r STG
-  
+
   # IP证书默认有效期6天
   ask "📅 证书有效期 [默认 ${IP_CERT_DAYS} 天]: "
   read -r cert_days; cert_days=${cert_days:-$IP_CERT_DAYS}
-  
+
   # 自动创建验证目录
   ok "正在创建验证目录..."
   create_webroot_directory "$VALIDATION_WEBROOT"
-  
+
   # Web服务器配置选项
   echo
   echo "🌐 Web 服务器配置选项:"
@@ -891,10 +1030,10 @@ prompt_ip_cert_params() {
   echo "[2] 自动配置 Caddy"
   echo "[3] 显示配置示例（手动配置）"
   echo "[4] 已配置好，跳过"
-  
+
   ask "选择 (1-4): "
   read -r config_choice
-  
+
   case "$config_choice" in
     1)
       configure_nginx_automatically "$VALIDATION_WEBROOT"
@@ -917,7 +1056,7 @@ prompt_ip_cert_params() {
       read -r
       ;;
   esac
-  
+
   # 检查验证目录可访问性
   ask "是否测试验证目录可访问性? (y/N): "
   read -r test_access
@@ -935,7 +1074,7 @@ prompt_ip_cert_params() {
       [[ "$continue_anyway" =~ ^[Yy]$ ]] || return 1
     fi
   fi
-  
+
   # 保存验证目录设置
   save_kv VALIDATION_WEBROOT "$VALIDATION_WEBROOT"
 }
@@ -1042,15 +1181,19 @@ issue_flow() {
   echo "请选择证书类型:"
   echo "[1] 域名证书 (使用 DNS-01 验证)"
   echo "[2] IP 证书 (使用 HTTP-01 验证)"
-  ask "选择类型 (1/2): "
+  echo "[3] 自签证书 (用于内部使用/CDN回源)"
+  ask "选择类型 (1/2/3): "
   read -r cert_type_choice
-  
+
   case "$cert_type_choice" in
     1)
       issue_domain_cert_flow
       ;;
     2)
       issue_ip_cert_flow
+      ;;
+    3)
+      generate_self_signed_cert
       ;;
     *)
       warn "无效选择"
@@ -1062,26 +1205,73 @@ issue_flow() {
 # ===== 证书管理 =====
 list_certs() {
   ensure_acme
+  echo "========== ACME 管理的证书 =========="
   "$ACME" --list
+  
+  echo ""
+  echo "========== 自签证书 =========="
+  local self_signed_dirs=()
+  while IFS= read -r -d '' dir; do
+    if [[ -f "${dir}/cert.pem" ]] && [[ -f "${dir}/privkey.key" ]]; then
+      self_signed_dirs+=("$dir")
+    fi
+  done < <(find "$OUT_DIR_BASE" -maxdepth 1 -type d -name "*-selfsigned" -print0 2>/dev/null || true)
+  
+  if [[ ${#self_signed_dirs[@]} -eq 0 ]]; then
+    echo "未找到自签证书"
+  else
+    for dir in "${self_signed_dirs[@]}"; do
+      local cert_name=$(basename "$dir")
+      if [[ -f "${dir}/cert.pem" ]]; then
+        local expiry_info
+        expiry_info=$(openssl x509 -in "${dir}/cert.pem" -noout -enddate 2>/dev/null | cut -d= -f2- || echo "未知")
+        echo "  - ${cert_name} (有效期至: ${expiry_info})"
+      fi
+    done
+  fi
 }
 
 show_cert_path() {
   load_config
-  ask "输入域名或IP地址以显示证书路径: "
+  ask "输入域名、IP地址或证书标识以显示证书路径: "
   read -r d
+  
+  # 先检查标准路径
   local p="${OUT_DIR_BASE}/${d}"
   if [[ -d "$p" ]]; then
     ok "证书路径：$p"
     ls -l "$p"
-  else
-    err "未找到路径：$p"
+    return 0
   fi
+  
+  # 检查自签证书路径
+  local self_p="${OUT_DIR_BASE}/${d}-selfsigned"
+  if [[ -d "$self_p" ]]; then
+    ok "自签证书路径：$self_p"
+    ls -l "$self_p"
+    return 0
+  fi
+  
+  err "未找到路径：$p 或 $self_p"
 }
 
 delete_cert() {
   ensure_acme
-  ask "输入要删除的域名或IP地址: "
+  ask "输入要删除的域名、IP地址或证书标识: "
   read -r d
+  
+  # 检查是否为自签证书
+  local self_p="${OUT_DIR_BASE}/${d}-selfsigned"
+  if [[ -d "$self_p" ]]; then
+    ask "删除自签证书目录 $self_p ? (y/N): "
+    read -r del_self
+    if [[ "$del_self" =~ ^[Yy]$ ]]; then
+      rm -rf "$self_p" && ok "已删除自签证书: $d" || warn "删除失败"
+    fi
+    return 0
+  fi
+  
+  # 标准证书删除流程
   ask "是否先吊销该证书（可选）? (y/N): "
   read -r rv
   if [[ "$rv" =~ ^[Yy]$ ]]; then
@@ -1130,6 +1320,18 @@ set_ip_cert_days() {
   ask "设置 IP 证书默认有效期（天数） [当前 ${IP_CERT_DAYS}]: "
   read -r days
   [[ -n "$days" ]] && save_kv IP_CERT_DAYS "$days" && ok "IP证书默认有效期设为 ${days} 天"
+}
+set_selfsign_days() {
+  load_config
+  ask "设置自签证书默认有效期（天数） [当前 ${SELF_SIGN_DAYS}]: "
+  read -r days
+  [[ -n "$days" ]] && save_kv SELF_SIGN_DAYS "$days" && ok "自签证书默认有效期设为 ${days} 天"
+}
+set_selfsign_keylen() {
+  load_config
+  ask "设置自签证书默认密钥长度 [2048|3072|4096] [当前 ${SELF_SIGN_KEYLEN}]: "
+  read -r keylen
+  [[ -n "$keylen" ]] && save_kv SELF_SIGN_KEYLEN "$keylen" && ok "自签证书默认密钥长度设为 ${keylen} 位"
 }
 
 # ===== 更新与卸载 =====
@@ -1217,7 +1419,7 @@ main_menu() {
   while true; do
     echo
     echo "======== cert-easy ========"
-    echo "[1] 申请/续期证书 (支持域名和IP)"
+    echo "[1] 申请/续期证书 (支持域名、IP和自签证书)"
     echo "[2] 列出已管理证书"
     echo "[3] 显示某域名/IP证书路径"
     echo "[4] 删除证书（可选吊销并移出续期清单）"
@@ -1244,6 +1446,8 @@ main_menu() {
          echo "  [3] 设置证书根目录"
          echo "  [4] 设置HTTP-01验证目录"
          echo "  [5] 设置IP证书默认有效期"
+         echo "  [6] 设置自签证书默认有效期"
+         echo "  [7] 设置自签证书默认密钥长度"
          echo "  [0] 返回上级"
          ask "选择: "
          read -r s
@@ -1253,6 +1457,8 @@ main_menu() {
            3) set_outdir_base ;;
            4) set_validation_webroot ;;
            5) set_ip_cert_days ;;
+           6) set_selfsign_days ;;
+           7) set_selfsign_keylen ;;
            0) ;;
            *) warn "无效选择" ;;
          esac 
