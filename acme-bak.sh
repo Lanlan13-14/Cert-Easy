@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cert-easy: 交互式 DNS-01 证书申请/管理，支持 Cloudflare / DNSPod(CN&Global) / 阿里云(CN&Global) / dynv6 / 火山引擎 / 华为云(CN) / 百度云
+# cert-easy: 交互式 DNS-01/HTTP-01 证书申请/管理，支持域名和IP证书
 # 功能：申请/安装、列出/查看/删除证书；凭据新增/删除（删除前提示依赖域名）；温和的自动续期策略；更新脚本；两级卸载
 # 支持：CentOS, Debian, Ubuntu, Alpine, Arch Linux
 set -Eeuo pipefail
@@ -14,6 +14,9 @@ OUT_DIR_BASE_DEFAULT="/etc/ssl/acme"
 KEYLEN_DEFAULT="ec-256"            # ec-256 | ec-384 | 2048 | 3072 | 4096
 AUTO_RENEW_DEFAULT="1"             # 1=开启自动续期；0=关闭但保留 cron 任务
 CRON_WRAPPER="/usr/local/bin/cert-easy-cron"
+# IP证书相关配置
+VALIDATION_WEBROOT_DEFAULT="/wwwroot/letsencrypt"
+IP_CERT_DAYS_DEFAULT="6"           # IP证书默认有效期6天
 
 # ===== 系统检测和依赖管理 =====
 detect_os() {
@@ -43,7 +46,7 @@ install_dependencies() {
     local curl_pkg="curl"
     local openssl_pkg="openssl"
     local cron_pkg=""
-    
+
     case "$OS_NAME" in
         centos|rhel|fedora)
             if command -v dnf >/dev/null 2>&1; then
@@ -80,20 +83,20 @@ install_dependencies() {
 
     # 安装依赖
     local to_install=()
-    
+
     if ! command -v curl >/dev/null 2>&1; then
         to_install+=("$curl_pkg")
     fi
-    
+
     if ! command -v openssl >/dev/null 2>&1; then
         to_install+=("$openssl_pkg")
     fi
-    
+
     # 对于crontab，我们检查命令是否存在，如果不存在且知道包名则安装
     if ! command -v crontab >/dev/null 2>&1 && [[ -n "$cron_pkg" ]]; then
         to_install+=("$cron_pkg")
     fi
-    
+
     if [[ ${#to_install[@]} -gt 0 ]]; then
         ok "安装依赖: ${to_install[*]}"
         if [[ "$OS_NAME" == "alpine" ]]; then
@@ -106,7 +109,7 @@ install_dependencies() {
             }
         fi
     fi
-    
+
     # 再次检查关键依赖
     ensure_cmd curl
     ensure_cmd openssl
@@ -140,6 +143,8 @@ load_config() {
   OUT_DIR_BASE="${OUT_DIR_BASE:-$OUT_DIR_BASE_DEFAULT}"
   KEYLEN_DEFAULT="${KEYLEN_DEFAULT:-$KEYLEN_DEFAULT}"
   AUTO_RENEW="${AUTO_RENEW:-$AUTO_RENEW_DEFAULT}"
+  VALIDATION_WEBROOT="${VALIDATION_WEBROOT:-$VALIDATION_WEBROOT_DEFAULT}"
+  IP_CERT_DAYS="${IP_CERT_DAYS:-$IP_CERT_DAYS_DEFAULT}"
 }
 save_kv() {
   local k="$1" v="$2"
@@ -154,7 +159,7 @@ save_kv() {
 init_minimal() {
   detect_os
   install_dependencies
-  
+
   load_config
   if [[ -z "${EMAIL}" ]]; then
     ask "📧 首次使用，输入 ACME 账号邮箱: "
@@ -164,6 +169,8 @@ init_minimal() {
   save_kv OUT_DIR_BASE "$OUT_DIR_BASE"
   save_kv KEYLEN_DEFAULT "$KEYLEN_DEFAULT"
   save_kv AUTO_RENEW "$AUTO_RENEW"
+  save_kv VALIDATION_WEBROOT "$VALIDATION_WEBROOT"
+  save_kv IP_CERT_DAYS "$IP_CERT_DAYS"
 }
 
 # ===== acme.sh 安装 =====
@@ -336,7 +343,7 @@ add_or_update_creds() {
   ask "选择提供商编号 (1-9): "
   read -r choice
   local p; p=$(get_provider_by_choice "$choice") || { warn "无效选择"; return 1; }
-  
+
   case "$p" in
     cf)
       ask "优先推荐 CF_Token。输入 CF_Token (留空则改为 CF_Key/CF_Email): "
@@ -478,14 +485,296 @@ delete_provider_creds() {
   ok "已从 $CRED_FILE 删除 $label 的凭迹"
 }
 
+# ===== IP地址获取函数 =====
+get_public_ipv4() {
+  # 尝试多个IP检测服务
+  local ip=""
+  local services=(
+    "https://api.ipify.org"
+    "https://ifconfig.me"
+    "https://icanhazip.com"
+    "https://checkip.amazonaws.com"
+  )
+
+  for service in "${services[@]}"; do
+    if ip=$(curl -4 -s --connect-timeout 5 "$service" 2>/dev/null); then
+      # 验证IP地址格式
+      if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        echo "$ip"
+        return 0
+      fi
+    fi
+  done
+
+  return 1
+}
+
+get_public_ipv6() {
+  local ip=""
+  local services=(
+    "https://api64.ipify.org"
+    "https://icanhazip.com"
+  )
+
+  for service in "${services[@]}"; do
+    if ip=$(curl -6 -s --connect-timeout 5 "$service" 2>/dev/null); then
+      # 简单验证IPv6格式
+      if [[ "$ip" =~ : ]]; then
+        echo "$ip"
+        return 0
+      fi
+    fi
+  done
+
+  return 1
+}
+
+# ===== Web服务器配置辅助函数 =====
+detect_web_server_user() {
+  # 尝试检测Web服务器用户
+  local user=""
+
+  # 检查Nginx用户
+  if command -v nginx >/dev/null 2>&1; then
+    if nginx -T 2>/dev/null | grep -q "user "; then
+      user=$(nginx -T 2>/dev/null | grep "user " | head -1 | awk '{print $2}' | tr -d ';')
+    fi
+  fi
+
+  # 如果没找到，尝试常见用户
+  if [[ -z "$user" ]]; then
+    for test_user in www-data nginx apache http; do
+      if id "$test_user" &>/dev/null; then
+        user="$test_user"
+        break
+      fi
+    done
+  fi
+
+  echo "${user:-www-data}"
+}
+
+create_webroot_directory() {
+  local webroot="$1"
+
+  # 创建目录结构
+  mkdir -p "${webroot}/.well-known/acme-challenge"
+  mkdir -p "${webroot}/.well-known/pki-validation"
+
+  # 获取Web服务器用户
+  local web_user
+  web_user=$(detect_web_server_user)
+
+  # 设置权限
+  chmod -R 755 "$webroot"
+  if chown -R "${web_user}:${web_user}" "$webroot" 2>/dev/null; then
+    ok "已创建验证目录并设置所有权给 ${web_user} 用户: ${webroot}"
+  else
+    warn "无法更改目录所有权，请手动检查 ${webroot} 的权限"
+  fi
+}
+
+configure_nginx_automatically() {
+  local webroot="$1"
+  local nginx_config="/etc/nginx/sites-available/default"
+
+  # 检查是否有其他Nginx配置文件
+  if [[ ! -f "$nginx_config" ]]; then
+    nginx_config="/etc/nginx/nginx.conf"
+  fi
+
+  ask "Nginx 配置文件路径 [默认: ${nginx_config}]: "
+  read -r custom_config
+  nginx_config="${custom_config:-$nginx_config}"
+
+  # 备份原配置文件
+  if [[ -f "$nginx_config" ]]; then
+    cp "$nginx_config" "${nginx_config}.bak-$(date +%Y%m%d%H%M%S)"
+    ok "已备份原配置文件到 ${nginx_config}.bak"
+  fi
+
+  # 创建配置文件
+  cat > "$nginx_config" <<EOF
+server {
+    listen 80 default_server;
+    server_name _;
+
+    location /.well-known/acme-challenge/ {
+        root ${webroot};
+        add_header Content-Type text/plain;
+    }
+
+    location /.well-known/pki-validation/ {
+        root ${webroot};
+        add_header Content-Type text/plain;
+    }
+
+    # 其他请求返回 404（可选，防止暴露其他内容）
+    location / {
+        return 404;
+    }
+}
+EOF
+
+  ok "已写入 Nginx 配置文件: ${nginx_config}"
+
+  # 测试配置
+  if nginx -t; then
+    ok "Nginx 配置测试成功"
+    ask "是否重载 Nginx 配置? (y/N): "
+    read -r reload
+    if [[ "$reload" =~ ^[Yy]$ ]]; then
+      systemctl reload nginx || service nginx reload || /etc/init.d/nginx reload
+      ok "Nginx 配置已重载"
+    fi
+  else
+    warn "Nginx 配置测试失败，请手动检查配置文件"
+  fi
+}
+
+configure_caddy_automatically() {
+  local webroot="$1"
+  local caddy_config="/etc/caddy/Caddyfile"
+
+  ask "Caddy 配置文件路径 [默认: ${caddy_config}]: "
+  read -r custom_config
+  caddy_config="${custom_config:-$caddy_config}"
+
+  # 备份原配置文件
+  if [[ -f "$caddy_config" ]]; then
+    cp "$caddy_config" "${caddy_config}.bak-$(date +%Y%m%d%H%M%S)"
+    ok "已备份原配置文件到 ${caddy_config}.bak"
+  fi
+
+  # 创建配置文件
+  cat > "$caddy_config" <<EOF
+:80 {
+    handle_path /.well-known/acme-challenge/* {
+        root * ${webroot}
+        file_server
+        header Content-Type text/plain
+    }
+
+    handle_path /.well-known/pki-validation/* {
+        root * ${webroot}
+        file_server
+        header Content-Type text/plain
+    }
+
+    handle {
+        respond 404
+    }
+}
+EOF
+
+  ok "已写入 Caddy 配置文件: ${caddy_config}"
+
+  # 测试配置
+  if command -v caddy >/dev/null 2>&1; then
+    if caddy validate --config "$caddy_config"; then
+      ok "Caddy 配置验证成功"
+      ask "是否重载 Caddy 配置? (y/N): "
+      read -r reload
+      if [[ "$reload" =~ ^[Yy]$ ]]; then
+        systemctl reload caddy || service caddy reload || /etc/init.d/caddy reload
+        ok "Caddy 配置已重载"
+      fi
+    else
+      warn "Caddy 配置验证失败，请手动检查配置文件"
+    fi
+  else
+    warn "未找到 caddy 命令，跳过配置验证"
+  fi
+}
+
+show_web_server_manual_config() {
+  local webroot="$1"
+
+  echo "=========================================="
+  echo "📋 请手动配置您的 Web 服务器以支持 HTTP-01 验证"
+  echo "=========================================="
+  echo
+  echo "验证文件根目录: $webroot"
+  echo
+  echo "📝 Nginx 配置示例:"
+  cat <<NGINX_EXAMPLE
+server {
+    listen 80 default_server;
+    server_name _;
+
+    location /.well-known/acme-challenge/ {
+        root ${webroot};
+        add_header Content-Type text/plain;
+    }
+
+    location /.well-known/pki-validation/ {
+        root ${webroot};
+        add_header Content-Type text/plain;
+    }
+
+    # 其他请求返回 404（可选，防止暴露其他内容）
+    location / {
+        return 404;
+    }
+}
+NGINX_EXAMPLE
+
+  echo
+  echo "📝 Caddy 配置示例:"
+  cat <<CADDY_EXAMPLE
+:80 {
+    handle_path /.well-known/acme-challenge/* {
+        root * ${webroot}
+        file_server
+        header Content-Type text/plain
+    }
+
+    handle_path /.well-known/pki-validation/* {
+        root * ${webroot}
+        file_server
+        header Content-Type text/plain
+    }
+
+    handle {
+        respond 404
+    }
+}
+CADDY_EXAMPLE
+
+  echo
+  echo "💡 配置完成后，请测试并重载 Web 服务器"
+  echo "=========================================="
+}
+
+check_webroot_accessibility() {
+  local webroot="$1"
+  local ip_address="$2"
+  local test_file="${webroot}/.well-known/acme-challenge/test"
+
+  # 创建测试文件
+  mkdir -p "$(dirname "$test_file")"
+  echo "test-content-$(date +%s)" > "$test_file"
+  chmod 644 "$test_file"
+
+  # 尝试访问（使用 curl）
+  if curl -s -f --connect-timeout 10 "http://${ip_address}/.well-known/acme-challenge/test" 2>/dev/null | grep -q "test-content"; then
+    rm -f "$test_file"
+    return 0
+  fi
+
+  # 清理
+  rm -f "$test_file"
+  return 1
+}
+
 # ===== 证书申请/安装 =====
-prompt_issue_params() {
+prompt_domain_cert_params() {
   show_providers_menu
-  ask "选择提供商编号 (1-9): "
+  ask "选择 DNS 提供商编号 (1-9): "
   read -r choice
   local p; p=$(get_provider_by_choice "$choice") || { warn "无效选择"; return 1; }
   PROVIDER="$p"
-  
+
   ask "📛 主域名 (如 example.com): "
   read -r DOMAIN
   echo "提示：通配符 *.${DOMAIN} 可覆盖 www/api 等所有一级子域，需 DNS-01 验证。"
@@ -499,9 +788,161 @@ prompt_issue_params() {
   read -r STG
 }
 
-issue_flow() {
+prompt_ip_cert_params() {
   load_config
-  prompt_issue_params
+
+  # 自动获取公网IP
+  echo "🌐 正在检测公网IP地址..."
+
+  local ipv4=""
+  local ipv6=""
+  local selected_ip=""
+
+  if ipv4=$(get_public_ipv4); then
+    echo "✅ 检测到 IPv4: $ipv4"
+  else
+    warn "无法自动获取 IPv4 地址"
+  fi
+
+  if ipv6=$(get_public_ipv6); then
+    echo "✅ 检测到 IPv6: $ipv6"
+  else
+    warn "无法自动获取 IPv6 地址"
+  fi
+
+  if [[ -n "$ipv4" ]] || [[ -n "$ipv6" ]]; then
+    echo
+    echo "请选择IP地址或手动输入:"
+    if [[ -n "$ipv4" ]]; then
+      echo "[1] 使用检测到的 IPv4: $ipv4"
+    fi
+    if [[ -n "$ipv6" ]]; then
+      echo "[2] 使用检测到的 IPv6: $ipv6"
+    fi
+    echo "[3] 手动输入IP地址"
+
+    ask "选择 (1-3): "
+    read -r ip_choice
+
+    case "$ip_choice" in
+      1)
+        if [[ -n "$ipv4" ]]; then
+          selected_ip="$ipv4"
+        else
+          warn "IPv4 不可用"
+          ask "手动输入 IPv4 地址: "
+          read -r selected_ip
+        fi
+        ;;
+      2)
+        if [[ -n "$ipv6" ]]; then
+          selected_ip="$ipv6"
+        else
+          warn "IPv6 不可用"
+          ask "手动输入 IPv6 地址: "
+          read -r selected_ip
+        fi
+        ;;
+      3)
+        ask "手动输入 IP 地址: "
+        read -r selected_ip
+        ;;
+      *)
+        warn "无效选择"
+        ask "手动输入 IP 地址: "
+        read -r selected_ip
+        ;;
+    esac
+  else
+    ask "🌐 输入 IP 地址: "
+    read -r selected_ip
+  fi
+
+  # 验证IP地址格式
+  if [[ ! "$selected_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && [[ ! "$selected_ip" =~ : ]]; then
+    err "无效的IP地址格式"
+  fi
+
+  PUBLIC_IP="$selected_ip"
+  DOMAIN="$selected_ip"  # 使用IP作为域名
+
+  ask "📁 验证文件根目录 [默认 ${VALIDATION_WEBROOT}]: "
+  read -r webroot_input
+  VALIDATION_WEBROOT="${webroot_input:-$VALIDATION_WEBROOT}"
+
+  ask "🔑 密钥长度 [默认 ${KEYLEN_DEFAULT}]: "
+  read -r KEYLEN; KEYLEN=${KEYLEN:-$KEYLEN_DEFAULT}
+
+  ask "🧪 使用测试环境(避免频率限制)? (y/N): "
+  read -r STG
+
+  # IP证书默认有效期6天
+  ask "📅 证书有效期 [默认 ${IP_CERT_DAYS} 天]: "
+  read -r cert_days; cert_days=${cert_days:-$IP_CERT_DAYS}
+
+  # 自动创建验证目录
+  ok "正在创建验证目录..."
+  create_webroot_directory "$VALIDATION_WEBROOT"
+
+  # Web服务器配置选项
+  echo
+  echo "🌐 Web 服务器配置选项:"
+  echo "[1] 自动配置 Nginx"
+  echo "[2] 自动配置 Caddy"
+  echo "[3] 显示配置示例（手动配置）"
+  echo "[4] 已配置好，跳过"
+
+  ask "选择 (1-4): "
+  read -r config_choice
+
+  case "$config_choice" in
+    1)
+      configure_nginx_automatically "$VALIDATION_WEBROOT"
+      ;;
+    2)
+      configure_caddy_automatically "$VALIDATION_WEBROOT"
+      ;;
+    3)
+      show_web_server_manual_config "$VALIDATION_WEBROOT"
+      ask "按回车键继续..."
+      read -r
+      ;;
+    4)
+      ok "跳过Web服务器配置"
+      ;;
+    *)
+      warn "无效选择，显示配置示例"
+      show_web_server_manual_config "$VALIDATION_WEBROOT"
+      ask "按回车键继续..."
+      read -r
+      ;;
+  esac
+
+  # 检查验证目录可访问性
+  ask "是否测试验证目录可访问性? (y/N): "
+  read -r test_access
+  if [[ "$test_access" =~ ^[Yy]$ ]]; then
+    ok "正在测试验证目录可访问性..."
+    if check_webroot_accessibility "$VALIDATION_WEBROOT" "$PUBLIC_IP"; then
+      ok "验证目录可正常访问"
+    else
+      warn "无法访问验证目录，请检查以下事项："
+      echo "  1. Web 服务器是否正在运行"
+      echo "  2. 防火墙是否开放了 80 端口"
+      echo "  3. Web 服务器配置是否正确"
+      ask "是否继续? (y/N): "
+      read -r continue_anyway
+      [[ "$continue_anyway" =~ ^[Yy]$ ]] || return 1
+    fi
+  fi
+
+  # 保存验证目录设置
+  save_kv VALIDATION_WEBROOT "$VALIDATION_WEBROOT"
+}
+
+issue_domain_cert_flow() {
+  load_config
+  prompt_domain_cert_params || return 1
 
   ensure_acme
   export_provider_env "$PROVIDER"
@@ -550,6 +991,74 @@ issue_flow() {
   ensure_cron_job
 }
 
+issue_ip_cert_flow() {
+  load_config
+  prompt_ip_cert_params || return 1
+
+  ensure_acme
+
+  local server="letsencrypt"
+  [[ "$STG" =~ ^[Yy]$ ]] && server="letsencrypt_test"
+
+  ok "开始签发 IP 证书: $PUBLIC_IP  key=${KEYLEN}  server=${server}  days=${cert_days}"
+  "$ACME" --set-default-ca --server "$server" >/dev/null
+
+  # 签发IP证书（使用短有效期配置）
+  "$ACME" --issue --server "$server" \
+    -d "$PUBLIC_IP" \
+    -w "$VALIDATION_WEBROOT" \
+    --keylength "$KEYLEN" \
+    --certificate-profile shortlived \
+    --days "${cert_days}"
+
+  local OUT_DIR="${OUT_DIR_BASE}/${PUBLIC_IP}"
+  mkdir -p "$OUT_DIR"; chmod 700 "$OUT_DIR"; umask 077
+
+  local install_cmd=( "$ACME" --install-cert -d "$PUBLIC_IP"
+    --key-file       "$OUT_DIR/privkey.key"
+    --fullchain-file "$OUT_DIR/fullchain.pem"
+    --cert-file      "$OUT_DIR/cert.pem"
+    --ca-file        "$OUT_DIR/chain.pem"
+  )
+  if [[ -n "${RELOAD_CMD:-}" ]]; then
+    install_cmd+=( --reloadcmd "$RELOAD_CMD" )
+  fi
+  "${install_cmd[@]}"
+
+  chmod 600 "$OUT_DIR/privkey.key"
+  chmod 644 "$OUT_DIR/"*.pem
+
+  ok "IP 证书签发完成。证书与密钥路径："
+  echo "  - 私钥:        $OUT_DIR/privkey.key"
+  echo "  - 证书:        $OUT_DIR/cert.pem"
+  echo "  - 链证书:      $OUT_DIR/chain.pem"
+  echo "  - 全链:        $OUT_DIR/fullchain.pem"
+  echo ""
+  warn "注意：IP 证书有效期为 ${cert_days} 天，请确保自动续期配置正确"
+  ensure_cron_job
+}
+
+issue_flow() {
+  echo "请选择证书类型:"
+  echo "[1] 域名证书 (使用 DNS-01 验证)"
+  echo "[2] IP 证书 (使用 HTTP-01 验证)"
+  ask "选择类型 (1/2): "
+  read -r cert_type_choice
+
+  case "$cert_type_choice" in
+    1)
+      issue_domain_cert_flow
+      ;;
+    2)
+      issue_ip_cert_flow
+      ;;
+    *)
+      warn "无效选择"
+      return 1
+      ;;
+  esac
+}
+
 # ===== 证书管理 =====
 list_certs() {
   ensure_acme
@@ -558,7 +1067,7 @@ list_certs() {
 
 show_cert_path() {
   load_config
-  ask "输入域名以显示证书路径: "
+  ask "输入域名或IP地址以显示证书路径: "
   read -r d
   local p="${OUT_DIR_BASE}/${d}"
   if [[ -d "$p" ]]; then
@@ -571,7 +1080,7 @@ show_cert_path() {
 
 delete_cert() {
   ensure_acme
-  ask "输入要删除的域名: "
+  ask "输入要删除的域名或IP地址: "
   read -r d
   ask "是否先吊销该证书（可选）? (y/N): "
   read -r rv
@@ -609,6 +1118,18 @@ set_outdir_base() {
   ask "设置证书根目录 [当前 ${OUT_DIR_BASE}]: "
   read -r o
   [[ -n "$o" ]] && save_kv OUT_DIR_BASE "$o" && ok "证书根目录设为 $o"
+}
+set_validation_webroot() {
+  load_config
+  ask "设置 HTTP-01 验证文件根目录 [当前 ${VALIDATION_WEBROOT}]: "
+  read -r w
+  [[ -n "$w" ]] && save_kv VALIDATION_WEBROOT "$w" && ok "验证文件根目录设为 $w"
+}
+set_ip_cert_days() {
+  load_config
+  ask "设置 IP 证书默认有效期（天数） [当前 ${IP_CERT_DAYS}]: "
+  read -r days
+  [[ -n "$days" ]] && save_kv IP_CERT_DAYS "$days" && ok "IP证书默认有效期设为 ${days} 天"
 }
 
 # ===== 更新与卸载 =====
@@ -696,14 +1217,14 @@ main_menu() {
   while true; do
     echo
     echo "======== cert-easy ========"
-    echo "[1] 申请/续期证书 (DNS-01)"
+    echo "[1] 申请/续期证书 (支持域名和IP)"
     echo "[2] 列出已管理证书"
-    echo "[3] 显示某域名证书路径"
+    echo "[3] 显示某域名/IP证书路径"
     echo "[4] 删除证书（可选吊销并移出续期清单）"
     echo "[5] 自动续期开关 / 状态：$(cron_status)"
     echo "[6] 凭据管理：新增/更新"
     echo "[7] 凭据管理：删除（删除前列出依赖域名）"
-    echo "[8] 设置：重载命令 / 默认密钥长度 / 证书目录"
+    echo "[8] 设置"
     echo "[9] 更新脚本（从远程拉取并重启）"
     echo "[10] 卸载（一级/二级）"
     echo "[0] 退出"
@@ -717,9 +1238,12 @@ main_menu() {
       5) toggle_auto_renew ;;
       6) add_or_update_creds ;;
       7) delete_provider_creds ;;
-      8) echo "  [1] 设置重载命令"
+      8) 
+         echo "  [1] 设置重载命令"
          echo "  [2] 设置默认密钥长度"
          echo "  [3] 设置证书根目录"
+         echo "  [4] 设置HTTP-01验证目录"
+         echo "  [5] 设置IP证书默认有效期"
          echo "  [0] 返回上级"
          ask "选择: "
          read -r s
@@ -727,9 +1251,12 @@ main_menu() {
            1) set_reload_cmd ;;
            2) set_keylen_default ;;
            3) set_outdir_base ;;
+           4) set_validation_webroot ;;
+           5) set_ip_cert_days ;;
            0) ;;
            *) warn "无效选择" ;;
-         esac ;;
+         esac 
+         ;;
       9) update_self ;;
       10) uninstall_menu ;;
       0) echo -e "\033[1;32m[✔]\033[0m 已退出。下次使用请输入: sudo cert-easy"; exit 0 ;;
