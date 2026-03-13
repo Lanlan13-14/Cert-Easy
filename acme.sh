@@ -1233,59 +1233,292 @@ list_certs() {
 
 show_cert_path() {
   load_config
-  ask "输入域名、IP地址或证书标识以显示证书路径: "
-  read -r d
   
-  # 先检查标准路径
-  local p="${OUT_DIR_BASE}/${d}"
-  if [[ -d "$p" ]]; then
-    ok "证书路径：$p"
-    ls -l "$p"
+  # 收集所有可用的证书
+  local certs=()
+  local cert_names=()
+  local cert_paths=()
+  
+  # 收集 ACME 管理的证书（从 acme.sh 列表获取）
+  ensure_acme
+  local acme_list
+  acme_list=$("$ACME" --list 2>/dev/null | grep -E '^[^ ]+\.' | awk '{print $1}' || true)
+  
+  while IFS= read -r domain; do
+    [[ -n "$domain" ]] || continue
+    # 检查证书文件是否存在
+    local p="${OUT_DIR_BASE}/${domain}"
+    if [[ -d "$p" ]] && [[ -f "${p}/cert.pem" ]]; then
+      certs+=("$domain")
+      cert_names+=("$domain")
+      cert_paths+=("$p")
+    fi
+  done <<< "$acme_list"
+  
+  # 收集自签证书
+  while IFS= read -r -d '' dir; do
+    if [[ -f "${dir}/cert.pem" ]] && [[ -f "${dir}/privkey.key" ]]; then
+      local cert_name=$(basename "$dir" | sed 's/-selfsigned$//')
+      certs+=("${cert_name} (自签)")
+      cert_names+=("$cert_name")
+      cert_paths+=("$dir")
+    fi
+  done < <(find "$OUT_DIR_BASE" -maxdepth 1 -type d -name "*-selfsigned" -print0 2>/dev/null || true)
+  
+  # 如果没有找到任何证书
+  if [[ ${#certs[@]} -eq 0 ]]; then
+    warn "未找到任何证书"
+    return 1
+  fi
+  
+  # 显示证书列表供用户选择
+  echo "可用的证书:"
+  for i in "${!certs[@]}"; do
+    local idx=$((i+1))
+    echo "[$idx] ${certs[$i]}"
+  done
+  echo "[0] 返回"
+  
+  ask "请选择证书编号: "
+  read -r choice
+  
+  # 处理选择
+  if [[ "$choice" == "0" ]]; then
     return 0
   fi
   
-  # 检查自签证书路径
-  local self_p="${OUT_DIR_BASE}/${d}-selfsigned"
-  if [[ -d "$self_p" ]]; then
-    ok "自签证书路径：$self_p"
-    ls -l "$self_p"
-    return 0
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt ${#certs[@]} ]]; then
+    warn "无效选择"
+    return 1
   fi
   
-  err "未找到路径：$p 或 $self_p"
+  local selected_idx=$((choice-1))
+  local selected_cert="${cert_names[$selected_idx]}"
+  local cert_path="${cert_paths[$selected_idx]}"
+  
+  # 检查路径是否存在
+  if [[ ! -d "$cert_path" ]]; then
+    err "证书路径不存在: $cert_path"
+  fi
+  
+  # 显示证书信息（与申请证书时的格式保持一致）
+  ok "证书信息:"
+  echo "  主域名/标识: ${selected_cert}"
+  echo ""
+  echo "📁 证书路径: ${cert_path}"
+  echo "  - 私钥:        ${cert_path}/privkey.key"
+  echo "  - 证书:        ${cert_path}/cert.pem"
+  echo "  - 链证书:      ${cert_path}/chain.pem"
+  echo "  - 全链:        ${cert_path}/fullchain.pem"
+  echo ""
+  
+  # 显示文件列表
+  if [[ -d "$cert_path" ]]; then
+    ls -l "$cert_path" | while read -r line; do
+      echo "  $line"
+    done
+  fi
+  
+  # 显示证书详细信息
+  if [[ -f "${cert_path}/cert.pem" ]]; then
+    echo ""
+    echo "📋 证书详细信息:"
+    openssl x509 -in "${cert_path}/cert.pem" -text -noout 2>/dev/null | grep -E "Subject:|Issuer:|Not Before:|Not After :|DNS:" | while read -r line; do
+      echo "  $line"
+    done
+  fi
 }
 
 delete_cert() {
-  ensure_acme
-  ask "输入要删除的域名、IP地址或证书标识: "
-  read -r d
+  load_config
   
-  # 检查是否为自签证书
-  local self_p="${OUT_DIR_BASE}/${d}-selfsigned"
-  if [[ -d "$self_p" ]]; then
-    ask "删除自签证书目录 $self_p ? (y/N): "
+  # 收集所有可用的证书
+  local certs=()
+  local cert_names=()
+  local cert_paths=()
+  local cert_types=()  # "acme" 或 "selfsigned"
+  
+  # 收集 ACME 管理的证书（从 acme.sh 列表获取）
+  ensure_acme
+  local acme_list
+  acme_list=$("$ACME" --list 2>/dev/null | grep -E '^[^ ]+\.' | awk '{print $1}' || true)
+  
+  while IFS= read -r domain; do
+    [[ -n "$domain" ]] || continue
+    # 检查证书文件是否存在
+    local p="${OUT_DIR_BASE}/${domain}"
+    if [[ -d "$p" ]] && [[ -f "${p}/cert.pem" ]]; then
+      certs+=("$domain")
+      cert_names+=("$domain")
+      cert_paths+=("$p")
+      cert_types+=("acme")
+    fi
+  done <<< "$acme_list"
+  
+  # 收集自签证书
+  while IFS= read -r -d '' dir; do
+    if [[ -f "${dir}/cert.pem" ]] && [[ -f "${dir}/privkey.key" ]]; then
+      local cert_name=$(basename "$dir" | sed 's/-selfsigned$//')
+      certs+=("${cert_name} (自签)")
+      cert_names+=("$cert_name")
+      cert_paths+=("$dir")
+      cert_types+=("selfsigned")
+    fi
+  done < <(find "$OUT_DIR_BASE" -maxdepth 1 -type d -name "*-selfsigned" -print0 2>/dev/null || true)
+  
+  # 如果没有找到任何证书
+  if [[ ${#certs[@]} -eq 0 ]]; then
+    warn "未找到任何证书"
+    return 1
+  fi
+  
+  # 显示证书列表供用户选择
+  echo "可删除的证书:"
+  for i in "${!certs[@]}"; do
+    local idx=$((i+1))
+    echo "[$idx] ${certs[$i]}"
+    
+    # 显示证书有效期信息
+    if [[ -f "${cert_paths[$i]}/cert.pem" ]]; then
+      local expiry_info
+      expiry_info=$(openssl x509 -in "${cert_paths[$i]}/cert.pem" -noout -enddate 2>/dev/null | cut -d= -f2- || echo "未知")
+      echo "     有效期至: ${expiry_info}"
+    fi
+  done
+  echo "[0] 返回"
+  
+  ask "请选择要删除的证书编号: "
+  read -r choice
+  
+  # 处理选择
+  if [[ "$choice" == "0" ]]; then
+    return 0
+  fi
+  
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt ${#certs[@]} ]]; then
+    warn "无效选择"
+    return 1
+  fi
+  
+  local selected_idx=$((choice-1))
+  local selected_cert="${cert_names[$selected_idx]}"
+  local cert_path="${cert_paths[$selected_idx]}"
+  local cert_type="${cert_types[$selected_idx]}"
+  
+  # 显示证书信息确认
+  echo ""
+  ok "您选择的证书:"
+  echo "  标识: ${selected_cert}"
+  echo "  类型: $([[ "$cert_type" == "acme" ]] && echo "ACME 证书" || echo "自签证书")"
+  echo "  路径: ${cert_path}"
+  
+  if [[ -f "${cert_path}/cert.pem" ]]; then
+    local expiry_info
+    expiry_info=$(openssl x509 -in "${cert_path}/cert.pem" -noout -enddate 2>/dev/null | cut -d= -f2- || echo "未知")
+    local issuer_info
+    issuer_info=$(openssl x509 -in "${cert_path}/cert.pem" -noout -issuer 2>/dev/null | cut -d= -f2- || echo "未知")
+    echo "  颁发者: ${issuer_info}"
+    echo "  有效期至: ${expiry_info}"
+  fi
+  
+  echo ""
+  
+  # 处理自签证书
+  if [[ "$cert_type" == "selfsigned" ]]; then
+    ask "确认删除自签证书目录 ${cert_path} ? (y/N): "
     read -r del_self
     if [[ "$del_self" =~ ^[Yy]$ ]]; then
-      rm -rf "$self_p" && ok "已删除自签证书: $d" || warn "删除失败"
+      rm -rf "$cert_path" && ok "已删除自签证书: ${selected_cert}" || warn "删除失败"
+    else
+      warn "已取消删除"
     fi
     return 0
   fi
   
-  # 标准证书删除流程
-  ask "是否先吊销该证书（可选）? (y/N): "
-  read -r rv
-  if [[ "$rv" =~ ^[Yy]$ ]]; then
-    "$ACME" --revoke -d "$d" || warn "吊销失败或已吊销: $d"
+  # 标准证书删除流程（ACME证书）
+  echo "请选择删除方式:"
+  echo "[1] 仅从 acme.sh 移除（保留证书文件）"
+  echo "[2] 吊销并删除（从 acme.sh 移除并删除证书文件）"
+  echo "[3] 完全删除（吊销、从 acme.sh 移除、删除证书文件）"
+  echo "[0] 取消"
+  
+  ask "请选择 (0-3): "
+  read -r delete_option
+  
+  case "$delete_option" in
+    0)
+      warn "已取消删除"
+      return 0
+      ;;
+    1)
+      # 仅从 acme.sh 移除
+      "$ACME" --remove -d "$selected_cert" && ok "已从 acme.sh 移除证书管理项: ${selected_cert}"
+      warn "证书文件已保留: ${cert_path}"
+      ;;
+    2)
+      # 吊销并删除（从 acme.sh 移除并删除证书文件）
+      ask "是否确认吊销证书 ${selected_cert}? (y/N): "
+      read -r confirm_revoke
+      if [[ "$confirm_revoke" =~ ^[Yy]$ ]]; then
+        "$ACME" --revoke -d "$selected_cert" 2>/dev/null && ok "证书已吊销: ${selected_cert}" || warn "吊销失败或证书无需吊销"
+      fi
+      
+      "$ACME" --remove -d "$selected_cert" && ok "已从 acme.sh 移除证书管理项: ${selected_cert}"
+      
+      if [[ -d "$cert_path" ]]; then
+        ask "确认删除证书文件目录 ${cert_path} ? (y/N): "
+        read -r del_files
+        if [[ "$del_files" =~ ^[Yy]$ ]]; then
+          rm -rf "$cert_path" && ok "已删除证书文件: ${cert_path}"
+        else
+          warn "证书文件已保留: ${cert_path}"
+        fi
+      fi
+      ;;
+    3)
+      # 完全删除
+      ask "⚠️  危险操作！确认完全删除证书 ${selected_cert} ？(必须输入 yes 确认): "
+      read -r confirm_full
+      if [[ "$confirm_full" != "yes" ]]; then
+        warn "已取消删除"
+        return 0
+      fi
+      
+      # 吊销
+      "$ACME" --revoke -d "$selected_cert" 2>/dev/null && ok "证书已吊销: ${selected_cert}" || warn "吊销失败或证书无需吊销"
+      
+      # 从 acme.sh 移除
+      "$ACME" --remove -d "$selected_cert" && ok "已从 acme.sh 移除证书管理项: ${selected_cert}"
+      
+      # 删除证书文件
+      if [[ -d "$cert_path" ]]; then
+        rm -rf "$cert_path" && ok "已删除证书文件: ${cert_path}"
+      fi
+      
+      # 同时删除可能的备份目录
+      local backup_path="${OUT_DIR_BASE}/.${selected_cert}.bak"
+      if [[ -d "$backup_path" ]]; then
+        rm -rf "$backup_path" && ok "已删除证书备份: ${backup_path}"
+      fi
+      ;;
+    *)
+      warn "无效选择"
+      return 1
+      ;;
+  esac
+  
+  # 检查 acme.sh 配置目录中是否还有相关文件
+  local acme_conf_dir="${ACME_HOME}/${selected_cert}"
+  if [[ -d "$acme_conf_dir" ]]; then
+    warn "检测到 acme.sh 配置目录: ${acme_conf_dir}"
+    ask "是否同时删除该配置目录? (y/N): "
+    read -r del_conf
+    if [[ "$del_conf" =~ ^[Yy]$ ]]; then
+      rm -rf "$acme_conf_dir" && ok "已删除 acme.sh 配置目录"
+    fi
   fi
-  "$ACME" --remove -d "$d" && ok "已删除证书管理项并移出续期清单：$d"
-
-  load_config
-  local p="${OUT_DIR_BASE}/${d}"
-  if [[ -d "$p" ]]; then
-    ask "删除本地证书文件目录 $p ? (y/N): "
-    read -r delp
-    [[ "$delp" =~ ^[Yy]$ ]] && rm -rf -- "$p" && ok "已删除 $p"
-  fi
+  
+  ok "证书删除操作完成"
 }
 
 # ===== 设置 =====
