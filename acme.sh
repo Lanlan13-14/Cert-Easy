@@ -583,29 +583,41 @@ create_webroot_directory() {
 
 configure_nginx_automatically() {
   local webroot="$1"
-  local nginx_config="/etc/nginx/sites-available/default"
-
-  # 检查是否有其他Nginx配置文件
-  if [[ ! -f "$nginx_config" ]]; then
-    nginx_config="/etc/nginx/nginx.conf"
+  local nginx_conf_file=""
+  
+  # 检测Nginx配置目录
+  if [[ -d "/etc/nginx/conf.d" ]]; then
+    nginx_conf_file="/etc/nginx/conf.d/acme-challenge.conf"
+  elif [[ -d "/etc/nginx/sites-enabled" ]]; then
+    nginx_conf_file="/etc/nginx/sites-enabled/acme-challenge"
+  else
+    nginx_conf_file="/etc/nginx/acme-challenge.conf"
   fi
 
-  ask "Nginx 配置文件路径 [默认: ${nginx_config}]: "
+  ask "Nginx 验证配置文件路径 [默认: ${nginx_conf_file}]: "
   read -r custom_config
-  nginx_config="${custom_config:-$nginx_config}"
+  nginx_conf_file="${custom_config:-$nginx_conf_file}"
 
-  # 备份原配置文件
-  if [[ -f "$nginx_config" ]]; then
-    cp "$nginx_config" "${nginx_config}.bak-$(date +%Y%m%d%H%M%S)"
-    ok "已备份原配置文件到 ${nginx_config}.bak"
+  # 创建配置目录（如果不存在）
+  mkdir -p "$(dirname "$nginx_conf_file")"
+
+  # 备份已存在的配置文件
+  if [[ -f "$nginx_conf_file" ]]; then
+    cp "$nginx_conf_file" "${nginx_conf_file}.bak-$(date +%Y%m%d%H%M%S)"
+    ok "已备份原配置文件到 ${nginx_conf_file}.bak"
   fi
 
-  # 创建配置文件
-  cat > "$nginx_config" <<EOF
+  # 写入新的验证配置（单独配置文件，不覆盖主配置）
+  cat > "$nginx_conf_file" <<EOF
+# ACME HTTP-01 验证配置
+# 由 cert-easy 自动生成 - $(date '+%Y-%m-%d %H:%M:%S')
+
 server {
-    listen 80 default_server;
+    listen 80;
+    listen [::]:80;
     server_name _;
 
+    # 仅处理ACME验证路径
     location /.well-known/acme-challenge/ {
         root ${webroot};
         add_header Content-Type text/plain;
@@ -615,15 +627,18 @@ server {
         root ${webroot};
         add_header Content-Type text/plain;
     }
-
-    # 其他请求返回 404（可选，防止暴露其他内容）
-    location / {
-        return 404;
-    }
 }
 EOF
 
-  ok "已写入 Nginx 配置文件: ${nginx_config}"
+  ok "已写入 Nginx 验证配置文件: ${nginx_conf_file}"
+  
+  # 提示用户需要确保主配置包含此文件
+  if [[ "$nginx_conf_file" == "/etc/nginx/conf.d/acme-challenge.conf" ]]; then
+    ok "配置文件已放置在 conf.d 目录，Nginx 会自动加载"
+  else
+    warn "请确保主配置文件中包含此文件:"
+    echo "  include ${nginx_conf_file};"
+  fi
 
   # 测试配置
   if nginx -t; then
@@ -631,31 +646,61 @@ EOF
     ask "是否重载 Nginx 配置? (y/N): "
     read -r reload
     if [[ "$reload" =~ ^[Yy]$ ]]; then
-      systemctl reload nginx || service nginx reload || /etc/init.d/nginx reload
-      ok "Nginx 配置已重载"
+      systemctl reload nginx 2>/dev/null || 
+      service nginx reload 2>/dev/null || 
+      /etc/init.d/nginx reload 2>/dev/null && 
+      ok "Nginx 配置已重载" || warn "Nginx 重载失败，请手动重载"
     fi
   else
     warn "Nginx 配置测试失败，请手动检查配置文件"
+    nginx -t
   fi
 }
 
 configure_caddy_automatically() {
   local webroot="$1"
-  local caddy_config="/etc/caddy/Caddyfile"
-
-  ask "Caddy 配置文件路径 [默认: ${caddy_config}]: "
-  read -r custom_config
-  caddy_config="${custom_config:-$caddy_config}"
-
-  # 备份原配置文件
-  if [[ -f "$caddy_config" ]]; then
-    cp "$caddy_config" "${caddy_config}.bak-$(date +%Y%m%d%H%M%S)"
-    ok "已备份原配置文件到 ${caddy_config}.bak"
+  local caddy_conf_file=""
+  local caddy_main_config=""
+  
+  # 检测Caddy主配置文件
+  if [[ -f "/etc/caddy/Caddyfile" ]]; then
+    caddy_main_config="/etc/caddy/Caddyfile"
+  elif [[ -f "/etc/caddy/Caddyfile.json" ]]; then
+    caddy_main_config="/etc/caddy/Caddyfile.json"
+  elif [[ -f "/etc/caddy/config.json" ]]; then
+    caddy_main_config="/etc/caddy/config.json"
+  fi
+  
+  # 检测Caddy配置目录
+  if [[ -d "/etc/caddy/conf.d" ]]; then
+    caddy_conf_file="/etc/caddy/conf.d/acme-challenge.caddy"
+  elif [[ -d "/etc/caddy" ]]; then
+    caddy_conf_file="/etc/caddy/acme-challenge.caddy"
+  else
+    caddy_conf_file="/etc/caddy/acme-challenge.caddy"
+    mkdir -p "/etc/caddy"
   fi
 
-  # 创建配置文件
-  cat > "$caddy_config" <<EOF
+  ask "Caddy 验证配置文件路径 [默认: ${caddy_conf_file}]: "
+  read -r custom_config
+  caddy_conf_file="${custom_config:-$caddy_conf_file}"
+
+  # 创建配置目录（如果不存在）
+  mkdir -p "$(dirname "$caddy_conf_file")"
+
+  # 备份已存在的配置文件
+  if [[ -f "$caddy_conf_file" ]]; then
+    cp "$caddy_conf_file" "${caddy_conf_file}.bak-$(date +%Y%m%d%H%M%S)"
+    ok "已备份原配置文件到 ${caddy_conf_file}.bak"
+  fi
+
+  # 写入新的验证配置（单独配置文件）
+  cat > "$caddy_conf_file" <<EOF
+# ACME HTTP-01 验证配置
+# 由 cert-easy 自动生成 - $(date '+%Y-%m-%d %H:%M:%S')
+
 :80 {
+    # 仅处理ACME验证路径
     handle_path /.well-known/acme-challenge/* {
         root * ${webroot}
         file_server
@@ -667,30 +712,151 @@ configure_caddy_automatically() {
         file_server
         header Content-Type text/plain
     }
-
-    handle {
-        respond 404
-    }
 }
 EOF
 
-  ok "已写入 Caddy 配置文件: ${caddy_config}"
+  ok "已写入 Caddy 验证配置文件: ${caddy_conf_file}"
+  
+  # 自动检测并写入主配置
+  local import_added=false
+  
+  if [[ -n "$caddy_main_config" ]] && [[ -f "$caddy_main_config" ]]; then
+    # 备份主配置文件
+    cp "$caddy_main_config" "${caddy_main_config}.bak-$(date +%Y%m%d%H%M%S)"
+    ok "已备份主配置文件到 ${caddy_main_config}.bak"
+    
+    # 检查是否已有导入语句
+    if grep -q "import.*$(basename "$caddy_conf_file")" "$caddy_main_config" 2>/dev/null || \
+       grep -q "import.*acme-challenge" "$caddy_main_config" 2>/dev/null; then
+      ok "主配置文件中已包含ACME验证配置导入"
+      import_added=true
+    else
+      # 检查配置文件格式
+      if [[ "$caddy_main_config" == *.json ]]; then
+        # JSON格式配置
+        warn "检测到JSON格式配置，请手动添加以下配置:"
+        echo ""
+        echo "在 \"imports\" 数组中添加:"
+        echo "  \"${caddy_conf_file}\""
+        echo ""
+      else
+        # Caddyfile格式 - 自动添加导入语句
+        echo "" >> "$caddy_main_config"
+        echo "# ACME HTTP-01 验证配置导入" >> "$caddy_main_config"
+        echo "import ${caddy_conf_file}" >> "$caddy_main_config"
+        ok "已自动添加导入语句到主配置文件: ${caddy_main_config}"
+        import_added=true
+      fi
+    fi
+  else
+    # 没有找到主配置文件，询问用户
+    ask "未找到Caddy主配置文件，是否创建新的主配置文件? (y/N): "
+    read -r create_main
+    if [[ "$create_main" =~ ^[Yy]$ ]]; then
+      if [[ -z "$caddy_main_config" ]]; then
+        caddy_main_config="/etc/caddy/Caddyfile"
+      fi
+      
+      # 创建主配置文件目录
+      mkdir -p "$(dirname "$caddy_main_config")"
+      
+      # 创建主配置文件
+      cat > "$caddy_main_config" <<EOF
+# Caddy 主配置文件
+# 由 cert-easy 自动创建 - $(date '+%Y-%m-%d %H:%M:%S')
+
+# 导入ACME验证配置
+import ${caddy_conf_file}
+
+# 在这里添加您的其他站点配置
+# example.com {
+#     reverse_proxy localhost:8080
+# }
+EOF
+      ok "已创建主配置文件: ${caddy_main_config}"
+      import_added=true
+    fi
+  fi
+  
+  if [[ "$import_added" == false ]]; then
+    warn "请在主Caddyfile中手动添加导入语句:"
+    echo "  import ${caddy_conf_file}"
+  fi
 
   # 测试配置
   if command -v caddy >/dev/null 2>&1; then
-    if caddy validate --config "$caddy_config"; then
-      ok "Caddy 配置验证成功"
-      ask "是否重载 Caddy 配置? (y/N): "
-      read -r reload
-      if [[ "$reload" =~ ^[Yy]$ ]]; then
-        systemctl reload caddy || service caddy reload || /etc/init.d/caddy reload
-        ok "Caddy 配置已重载"
+    local test_config=""
+    
+    # 确定测试用的配置文件
+    if [[ -n "$caddy_main_config" ]] && [[ -f "$caddy_main_config" ]]; then
+      test_config="$caddy_main_config"
+    else
+      test_config="$caddy_conf_file"
+    fi
+    
+    # 根据配置文件格式进行测试
+    if [[ "$test_config" == *.json ]]; then
+      if caddy validate --config "$test_config" 2>/dev/null; then
+        ok "Caddy JSON配置验证成功"
+      else
+        warn "Caddy JSON配置验证失败"
+        caddy validate --config "$test_config" 2>&1 | head -20
       fi
     else
-      warn "Caddy 配置验证失败，请手动检查配置文件"
+      if caddy validate --config "$test_config" 2>/dev/null; then
+        ok "Caddy 配置验证成功"
+        
+        # 询问是否重载
+        ask "是否重载 Caddy 配置? (y/N): "
+        read -r reload
+        if [[ "$reload" =~ ^[Yy]$ ]]; then
+          if systemctl list-units --full -all 2>/dev/null | grep -q "caddy.service"; then
+            systemctl reload caddy 2>/dev/null && ok "Caddy 配置已重载" || {
+              systemctl restart caddy 2>/dev/null && ok "Caddy 服务已重启" || warn "Caddy 重载失败"
+            }
+          elif service --status-all 2>/dev/null | grep -q "caddy"; then
+            service caddy reload 2>/dev/null || service caddy restart 2>/dev/null && ok "Caddy 服务已重载"
+          elif [[ -f "/etc/init.d/caddy" ]]; then
+            /etc/init.d/caddy reload 2>/dev/null || /etc/init.d/caddy restart 2>/dev/null && ok "Caddy 服务已重载"
+          else
+            warn "请手动重载 Caddy 服务"
+          fi
+        fi
+      else
+        warn "Caddy 配置验证失败"
+        caddy validate --config "$test_config" 2>&1 | head -20
+        
+        # 如果验证失败，提供恢复选项
+        ask "是否恢复备份的配置文件? (y/N): "
+        read -r restore
+        if [[ "$restore" =~ ^[Yy]$ ]]; then
+          if [[ -f "${caddy_main_config}.bak" ]]; then
+            mv "${caddy_main_config}.bak" "$caddy_main_config"
+            ok "已恢复主配置文件"
+          fi
+          if [[ -f "${caddy_conf_file}.bak" ]]; then
+            mv "${caddy_conf_file}.bak" "$caddy_conf_file"
+            ok "已恢复验证配置文件"
+          fi
+        fi
+      fi
     fi
   else
-    warn "未找到 caddy 命令，跳过配置验证"
+    warn "未找到 caddy 命令，请手动验证配置"
+    echo "配置文件位置:"
+    echo "  - 主配置: ${caddy_main_config:-未设置}"
+    echo "  - 验证配置: ${caddy_conf_file}"
+  fi
+  
+  # 显示配置总结
+  echo ""
+  echo "📋 Caddy 配置总结:"
+  echo "  • 验证配置文件: ${caddy_conf_file}"
+  echo "  • 主配置文件: ${caddy_main_config:-未找到}"
+  if [[ "$import_added" == true ]]; then
+    echo "  • 导入状态: ✅ 已自动添加"
+  else
+    echo "  • 导入状态: ⚠️  需要手动添加"
   fi
 }
 
@@ -703,10 +869,11 @@ show_web_server_manual_config() {
   echo
   echo "验证文件根目录: $webroot"
   echo
-  echo "📝 Nginx 配置示例:"
+  echo "📝 Nginx 配置示例 (单独配置文件):"
   cat <<NGINX_EXAMPLE
+# 创建文件: /etc/nginx/conf.d/acme-challenge.conf
 server {
-    listen 80 default_server;
+    listen 80;
     server_name _;
 
     location /.well-known/acme-challenge/ {
@@ -718,17 +885,17 @@ server {
         root ${webroot};
         add_header Content-Type text/plain;
     }
-
-    # 其他请求返回 404（可选，防止暴露其他内容）
-    location / {
-        return 404;
-    }
 }
+
+# 如果使用 sites-enabled 目录:
+# 创建文件: /etc/nginx/sites-enabled/acme-challenge
+# 内容同上
 NGINX_EXAMPLE
 
   echo
-  echo "📝 Caddy 配置示例:"
+  echo "📝 Caddy 配置示例 (单独配置文件):"
   cat <<CADDY_EXAMPLE
+# 创建文件: /etc/caddy/acme-challenge.caddy
 :80 {
     handle_path /.well-known/acme-challenge/* {
         root * ${webroot}
@@ -741,37 +908,70 @@ NGINX_EXAMPLE
         file_server
         header Content-Type text/plain
     }
-
-    handle {
-        respond 404
-    }
 }
+
+# 在主 Caddyfile 中添加:
+import /etc/caddy/acme-challenge.caddy
 CADDY_EXAMPLE
 
   echo
-  echo "💡 配置完成后，请测试并重载 Web 服务器"
+  echo "📝 Apache 配置示例 (单独配置文件):"
+  cat <<APACHE_EXAMPLE
+# 创建文件: /etc/apache2/conf-available/acme-challenge.conf
+Alias /.well-known/acme-challenge ${webroot}/.well-known/acme-challenge
+Alias /.well-known/pki-validation ${webroot}/.well-known/pki-validation
+
+<Directory ${webroot}>
+    Options None
+    AllowOverride None
+    Require all granted
+</Directory>
+
+# 启用配置:
+# a2enconf acme-challenge
+# systemctl reload apache2
+APACHE_EXAMPLE
+
+  echo
+  echo "💡 配置说明:"
+  echo "  • 使用单独配置文件，不影响现有网站配置"
+  echo "  • 仅处理 /.well-known/ 路径，其他请求仍由原配置处理"
+  echo "  • 配置完成后请测试并重载 Web 服务器"
   echo "=========================================="
 }
 
 check_webroot_accessibility() {
   local webroot="$1"
   local ip_address="$2"
-  local test_file="${webroot}/.well-known/acme-challenge/test"
+  local test_file="${webroot}/.well-known/acme-challenge/test-$(date +%s).txt"
+  local test_content="acme-test-$(date +%s)-${RANDOM}"
 
   # 创建测试文件
   mkdir -p "$(dirname "$test_file")"
-  echo "test-content-$(date +%s)" > "$test_file"
+  echo "$test_content" > "$test_file"
   chmod 644 "$test_file"
 
-  # 尝试访问（使用 curl）
-  if curl -s -f --connect-timeout 10 "http://${ip_address}/.well-known/acme-challenge/test" 2>/dev/null | grep -q "test-content"; then
-    rm -f "$test_file"
-    return 0
-  fi
+  local test_url="http://${ip_address}/.well-known/acme-challenge/$(basename "$test_file")"
+  
+  ok "测试文件已创建: $test_file"
+  ok "测试URL: $test_url"
 
-  # 清理
-  rm -f "$test_file"
-  return 1
+  # 尝试访问（使用 curl）
+  if curl -s -f --connect-timeout 10 "$test_url" 2>/dev/null | grep -q "$test_content"; then
+    rm -f "$test_file"
+    ok "验证目录可正常访问 ✓"
+    return 0
+  else
+    # 清理
+    rm -f "$test_file"
+    warn "无法访问验证目录 ✗"
+    echo "可能的原因:"
+    echo "  • Web服务器未运行"
+    echo "  • 防火墙阻止了80端口"
+    echo "  • 配置文件未正确加载"
+    echo "  • 文件权限问题"
+    return 1
+  fi
 }
 
 # ===== 自签证书生成函数 =====
